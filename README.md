@@ -24,6 +24,10 @@ Use menubar extra sliders or the keyboard, including native Apple keys!</p>
 
 <hr>
 
+## This fork
+
+See [DDC service matching on Apple Silicon](docs/ddc-service-matching.md) for the fix in this fork and local build instructions.
+
 ## Download
 
 Go to [Releases](https://github.com/MonitorControl/MonitorControl/releases) and download the latest `.dmg`, or you can install via Homebrew:

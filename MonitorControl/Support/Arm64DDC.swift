@@ -14,6 +14,36 @@ class Arm64DDC: NSObject {
   #endif
   static let MAX_MATCH_SCORE: Int = 20
 
+  struct EDIDIdentity: Hashable {
+    let vendor: UInt32
+    let model: UInt32
+    let serial: UInt32
+
+    init(displayID: CGDirectDisplayID) {
+      self.vendor = CGDisplayVendorNumber(displayID)
+      self.model = CGDisplayModelNumber(displayID)
+      self.serial = CGDisplaySerialNumber(displayID)
+    }
+
+    init?(service: IOAVService) {
+      var edid = [UInt8](repeating: 0, count: 128)
+      guard IOAVServiceReadI2C(service, 0x50, 0, &edid, UInt32(edid.count)) == KERN_SUCCESS,
+            edid.prefix(8).elementsEqual([0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x00]),
+            edid.reduce(0, &+) == 0
+      else {
+        return nil
+      }
+      self.vendor = UInt32(edid[8]) << 8 | UInt32(edid[9])
+      self.model = UInt32(edid[10]) | UInt32(edid[11]) << 8
+      self.serial = UInt32(edid[12]) | UInt32(edid[13]) << 8 | UInt32(edid[14]) << 16 | UInt32(edid[15]) << 24
+    }
+
+    func isCompatible(with identity: EDIDIdentity) -> Bool {
+      self.vendor == identity.vendor && self.model == identity.model &&
+        (self.serial == identity.serial || self.serial == 0 || identity.serial == 0)
+    }
+  }
+
   struct IOregService {
     var edidUUID: String = ""
     var manufacturerID: String = ""
@@ -26,6 +56,8 @@ class Arm64DDC: NSObject {
     var transportDownstream: String = ""
     var service: IOAVService?
     var serviceLocation: Int = 0
+    var registryID: UInt64 = 0
+    var edidIdentity: EDIDIdentity?
     var displayAttributes: NSDictionary?
   }
 
@@ -40,33 +72,66 @@ class Arm64DDC: NSObject {
   }
 
   static func getServiceMatches(displayIDs: [CGDirectDisplayID]) -> [Arm64Service] {
-    let ioregServicesForMatching = self.getIoregServicesForMatching()
+    let ioregServicesForMatching = self.getIoregServicesForMatching().filter { $0.service != nil }
+    let displaysByIdentity = Dictionary(grouping: displayIDs) { EDIDIdentity(displayID: $0) }
+    let servicesByIdentity = Dictionary(grouping: ioregServicesForMatching, by: \.edidIdentity)
     var matchedDisplayServices: [Arm64Service] = []
-    var scoredCandidateDisplayServices: [Int: [Arm64Service]] = [:]
+    var takenServiceLocations = Set<Int>()
+    var takenRegistryIDs = Set<UInt64>()
+    var takenDisplayIDs = Set<CGDirectDisplayID>()
+    // A framebuffer can be followed by several proxies, including inactive ones.
+    // Prefer the proxy whose live EDID identifies this display before scoring registry metadata.
     for displayID in displayIDs {
-      for ioregServiceForMatching in ioregServicesForMatching {
-        let score = self.ioregMatchScore(displayID: displayID, ioregEdidUUID: ioregServiceForMatching.edidUUID, ioDisplayLocation: ioregServiceForMatching.ioDisplayLocation, ioregProductName: ioregServiceForMatching.productName, ioregSerialNumber: ioregServiceForMatching.serialNumber, serviceLocation: ioregServiceForMatching.serviceLocation)
-        let discouraged = self.checkIfDiscouraged(ioregService: ioregServiceForMatching)
-        let dummy = self.checkIfDummy(ioregService: ioregServiceForMatching)
-        let displayService = Arm64Service(displayID: displayID, service: ioregServiceForMatching.service, serviceLocation: ioregServiceForMatching.serviceLocation, discouraged: discouraged, dummy: dummy, serviceDetails: ioregServiceForMatching, matchScore: score)
-        if scoredCandidateDisplayServices[score] == nil {
-          scoredCandidateDisplayServices[score] = []
+      let identity = EDIDIdentity(displayID: displayID)
+      guard identity.serial != 0, displaysByIdentity[identity]?.count == 1,
+            let candidates = servicesByIdentity[identity], candidates.count == 1,
+            let candidate = candidates.first, takenRegistryIDs.insert(candidate.registryID).inserted
+      else {
+        continue
+      }
+      matchedDisplayServices.append(self.serviceMatch(displayID: displayID, candidate: candidate, score: self.MAX_MATCH_SCORE))
+      takenDisplayIDs.insert(displayID)
+      takenServiceLocations.insert(candidate.serviceLocation)
+    }
+
+    var scoredCandidateDisplayServices: [Int: [Arm64Service]] = [:]
+    for displayID in displayIDs where !takenDisplayIDs.contains(displayID) {
+      let identity = EDIDIdentity(displayID: displayID)
+      for ioregServiceForMatching in ioregServicesForMatching where !takenRegistryIDs.contains(ioregServiceForMatching.registryID) {
+        // Keep the metadata fallback for unreadable EDIDs and overrides, but
+        // never point it at a proxy known to serve a different online display.
+        let liveIdentity = ioregServiceForMatching.edidIdentity
+        if let liveIdentity, liveIdentity.serial != 0, liveIdentity != identity, displaysByIdentity[liveIdentity] != nil {
+          continue
         }
-        scoredCandidateDisplayServices[score]?.append(displayService)
+        let score = self.ioregMatchScore(displayID: displayID, ioregEdidUUID: ioregServiceForMatching.edidUUID, ioDisplayLocation: ioregServiceForMatching.ioDisplayLocation, ioregProductName: ioregServiceForMatching.productName, ioregSerialNumber: ioregServiceForMatching.serialNumber, serviceLocation: ioregServiceForMatching.serviceLocation)
+        guard score > 0 else {
+          continue
+        }
+        let displayService = self.serviceMatch(displayID: displayID, candidate: ioregServiceForMatching, score: score)
+        // Ties still use registry topology to distinguish identical displays.
+        let priority = score * 2 + (liveIdentity?.isCompatible(with: identity) == true ? 1 : 0)
+        scoredCandidateDisplayServices[priority, default: []].append(displayService)
       }
     }
-    var takenServiceLocations: [Int] = []
-    var takenDisplayIDs: [CGDirectDisplayID] = []
-    for score in stride(from: self.MAX_MATCH_SCORE, to: 0, by: -1) {
-      if let scoredCandidateDisplayService = scoredCandidateDisplayServices[score] {
-        for candidateDisplayService in scoredCandidateDisplayService where !(takenDisplayIDs.contains(candidateDisplayService.displayID) || takenServiceLocations.contains(candidateDisplayService.serviceLocation)) {
-          takenDisplayIDs.append(candidateDisplayService.displayID)
-          takenServiceLocations.append(candidateDisplayService.serviceLocation)
-          matchedDisplayServices.append(candidateDisplayService)
+    for score in scoredCandidateDisplayServices.keys.sorted(by: >) {
+      for candidate in scoredCandidateDisplayServices[score, default: []] {
+        guard !takenDisplayIDs.contains(candidate.displayID),
+              !takenServiceLocations.contains(candidate.serviceLocation),
+              takenRegistryIDs.insert(candidate.serviceDetails.registryID).inserted
+        else {
+          continue
         }
+        takenDisplayIDs.insert(candidate.displayID)
+        takenServiceLocations.insert(candidate.serviceLocation)
+        matchedDisplayServices.append(candidate)
       }
     }
     return matchedDisplayServices
+  }
+
+  private static func serviceMatch(displayID: CGDirectDisplayID, candidate: IOregService, score: Int) -> Arm64Service {
+    Arm64Service(displayID: displayID, service: candidate.service, serviceLocation: candidate.serviceLocation, discouraged: self.checkIfDiscouraged(ioregService: candidate), dummy: self.checkIfDummy(ioregService: candidate), serviceDetails: candidate, matchScore: score)
   }
 
   static func read(service: IOAVService?, command: UInt8, writeSleepTime: UInt32? = nil, numOfWriteCycles: UInt8? = nil, readSleepTime: UInt32? = nil, numOfRetryAttemps: UInt8? = nil, retrySleepTime: UInt32? = nil) -> (current: UInt16, max: UInt16)? {
@@ -163,25 +228,24 @@ class Arm64DDC: NSObject {
     return matchScore
   }
 
-  static func ioregIterateToNextObjectOfInterest(interests: [String], iterator: inout io_iterator_t) -> (name: String, entry: io_service_t, preceedingEntry: io_service_t)? {
-    var entry: io_service_t = IO_OBJECT_NULL
-    var preceedingEntry: io_service_t = IO_OBJECT_NULL
+  static func ioregIterateToNextObjectOfInterest(interests: [String], iterator: io_iterator_t) -> (name: String, entry: io_service_t)? {
     let name = UnsafeMutablePointer<CChar>.allocate(capacity: MemoryLayout<io_name_t>.size)
     defer {
       name.deallocate()
     }
     while true {
-      preceedingEntry = entry
-      entry = IOIteratorNext(iterator)
-      guard IORegistryEntryGetName(entry, name) == KERN_SUCCESS, entry != MACH_PORT_NULL else {
-        break
+      let entry = IOIteratorNext(iterator)
+      guard entry != IO_OBJECT_NULL else {
+        return nil
       }
-      let nameString = String(cString: name)
-      for interest in interests where entry != IO_OBJECT_NULL && nameString.contains(interest) {
-        return (nameString, entry, preceedingEntry)
+      if IORegistryEntryGetName(entry, name) == KERN_SUCCESS {
+        let nameString = String(cString: name)
+        if interests.contains(where: { nameString.contains($0) }) {
+          return (nameString, entry)
+        }
       }
+      IOObjectRelease(entry)
     }
-    return nil
   }
 
   static func getIORegServiceAppleCDC2Properties(entry: io_service_t) -> IOregService {
@@ -221,10 +285,12 @@ class Arm64DDC: NSObject {
   }
 
   static func setIORegServiceDCPAVServiceProxy(entry: io_service_t, ioregService: inout IOregService) {
+    IORegistryEntryGetRegistryEntryID(entry, &ioregService.registryID)
     if let unmanagedLocation = IORegistryEntryCreateCFProperty(entry, "Location" as CFString, kCFAllocatorDefault, IOOptionBits(kIORegistryIterateRecursively)), let location = unmanagedLocation.takeRetainedValue() as? String {
       ioregService.location = location
-      if location == "External" {
-        ioregService.service = IOAVServiceCreateWithService(kCFAllocatorDefault, entry)?.takeRetainedValue() as IOAVService
+      if location == "External", let service = IOAVServiceCreateWithService(kCFAllocatorDefault, entry)?.takeRetainedValue() {
+        ioregService.service = service
+        ioregService.edidIdentity = EDIDIdentity(service: service)
       }
     }
   }
@@ -247,16 +313,18 @@ class Arm64DDC: NSObject {
     let keyDCPAVServiceProxy = "DCPAVServiceProxy"
     let keysFramebuffer = ["AppleCLCD2", "IOMobileFramebufferShim"]
     while true {
-      guard let objectOfInterest = ioregIterateToNextObjectOfInterest(interests: [keyDCPAVServiceProxy] + keysFramebuffer, iterator: &iterator) else {
+      guard let objectOfInterest = ioregIterateToNextObjectOfInterest(interests: [keyDCPAVServiceProxy] + keysFramebuffer, iterator: iterator) else {
         break
       }
+      defer { IOObjectRelease(objectOfInterest.entry) }
       if keysFramebuffer.contains(objectOfInterest.name) {
         ioregService = self.getIORegServiceAppleCDC2Properties(entry: objectOfInterest.entry)
         serviceLocation += 1
         ioregService.serviceLocation = serviceLocation
       } else if objectOfInterest.name == keyDCPAVServiceProxy {
-        self.setIORegServiceDCPAVServiceProxy(entry: objectOfInterest.entry, ioregService: &ioregService)
-        ioregServicesForMatching.append(ioregService)
+        var candidate = ioregService
+        self.setIORegServiceDCPAVServiceProxy(entry: objectOfInterest.entry, ioregService: &candidate)
+        ioregServicesForMatching.append(candidate)
       }
     }
     return ioregServicesForMatching

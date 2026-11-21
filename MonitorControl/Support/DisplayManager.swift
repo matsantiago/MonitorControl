@@ -334,30 +334,36 @@ class DisplayManager {
   }
 
   func updateArm64AVServices() {
-    if Arm64DDC.isArm64 {
-      os_log("arm64 AVService update requested", type: .info)
-      var displayIDs: [CGDirectDisplayID] = []
-      for otherDisplay in self.getOtherDisplays() {
-        displayIDs.append(otherDisplay.identifier)
+    guard Arm64DDC.isArm64 else {
+      return
+    }
+    os_log("arm64 AVService update requested", type: .info)
+    let displays = self.getOtherDisplays()
+    self.globalDDCQueue.sync {
+      let matches = Arm64DDC.getServiceMatches(displayIDs: displays.map(\.identifier))
+      for display in displays {
+        display.arm64avService = nil
+        display.arm64ddc = false
       }
-      for serviceMatch in Arm64DDC.getServiceMatches(displayIDs: displayIDs) {
-        for otherDisplay in self.getOtherDisplays() where otherDisplay.identifier == serviceMatch.displayID && serviceMatch.service != nil {
-          otherDisplay.arm64avService = serviceMatch.service
-          os_log("Display service match successful for display %{public}@", type: .info, String(serviceMatch.displayID))
-          if serviceMatch.discouraged {
-            os_log("Display %{public}@ is flagged as discouraged by Arm64DDC.", type: .info, String(serviceMatch.displayID))
-            otherDisplay.isDiscouraged = true
-          } else if serviceMatch.dummy {
-            os_log("Display %{public}@ is flagged as dummy by Arm64DDC.", type: .info, String(serviceMatch.displayID))
-            otherDisplay.isDiscouraged = true
-            otherDisplay.isDummy = true
-          } else {
-            otherDisplay.arm64ddc = DEBUG_SW ? false : true // MARK: (point of interest when testing)
-          }
+      for match in matches {
+        guard let display = displays.first(where: { $0.identifier == match.displayID }) else {
+          continue
+        }
+        display.arm64avService = match.service
+        os_log("Display service match successful for display %{public}@", type: .info, String(match.displayID))
+        if match.discouraged {
+          os_log("Display %{public}@ is flagged as discouraged by Arm64DDC.", type: .info, String(match.displayID))
+          display.isDiscouraged = true
+        } else if match.dummy {
+          os_log("Display %{public}@ is flagged as dummy by Arm64DDC.", type: .info, String(match.displayID))
+          display.isDiscouraged = true
+          display.isDummy = true
+        } else {
+          display.arm64ddc = !DEBUG_SW
         }
       }
-      os_log("AVService update done", type: .info)
     }
+    os_log("AVService update done", type: .info)
   }
 
   func resetSwBrightnessForAllDisplays(prefsOnly: Bool = false, noPrefSave: Bool = false, async: Bool = false) {
