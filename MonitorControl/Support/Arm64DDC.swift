@@ -101,7 +101,9 @@ class Arm64DDC: NSObject {
         // Keep the metadata fallback for unreadable EDIDs and overrides, but
         // never point it at a proxy known to serve a different online display.
         let liveIdentity = ioregServiceForMatching.edidIdentity
-        if let liveIdentity, liveIdentity.serial != 0, liveIdentity != identity, displaysByIdentity[liveIdentity] != nil {
+        if let liveIdentity, !liveIdentity.isCompatible(with: identity),
+           displaysByIdentity.keys.contains(where: { liveIdentity.isCompatible(with: $0) })
+        {
           continue
         }
         let score = self.ioregMatchScore(displayID: displayID, ioregEdidUUID: ioregServiceForMatching.edidUUID, ioDisplayLocation: ioregServiceForMatching.ioDisplayLocation, ioregProductName: ioregServiceForMatching.productName, ioregSerialNumber: ioregServiceForMatching.serialNumber, serviceLocation: ioregServiceForMatching.serviceLocation)

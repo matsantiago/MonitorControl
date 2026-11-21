@@ -24,10 +24,32 @@ DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer xcodebuild \
   -configuration Release -destination 'platform=macOS,arch=arm64' \
   -derivedDataPath "$build_dir/DerivedData" \
   -onlyUsePackageVersionsFromResolvedFile MACOSX_DEPLOYMENT_TARGET=12.0 \
-  CODE_SIGN_STYLE=Manual CODE_SIGN_IDENTITY=- DEVELOPMENT_TEAM= build
+  CODE_SIGN_STYLE=Manual CODE_SIGN_IDENTITY=- DEVELOPMENT_TEAM= \
+  CODE_SIGN_INJECT_BASE_ENTITLEMENTS=NO build
 ```
 
-O app fica em `$build_dir/DerivedData/Build/Products/Release/MonitorControl.app`. Ao substituir a instalação oficial, feche o MonitorControl e guarde uma cópia do app e das preferências. A assinatura local pode exigir uma nova autorização para as teclas de mídia em **Ajustes do Sistema → Privacidade e Segurança → Acessibilidade**. Desative a verificação automática de atualizações na instalação local e recompile o fork quando quiser atualizá-lo.
+O Sparkle fornecido pelo projeto tem assinatura própria. Para abrir a compilação ad hoc com o Hardened Runtime, assine o app local com a permissão de carregar essa biblioteca. Preserve as assinaturas originais dos componentes do Sparkle. [Documentação da Apple](https://developer.apple.com/documentation/bundleresources/entitlements/com.apple.security.cs.disable-library-validation)
+
+```sh
+app="$build_dir/DerivedData/Build/Products/Release/MonitorControl.app"
+cat > "$build_dir/local.entitlements" <<'PLIST'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>com.apple.security.cs.disable-library-validation</key>
+  <true/>
+</dict>
+</plist>
+PLIST
+codesign --force --sign - --options runtime \
+  --entitlements "$build_dir/local.entitlements" "$app"
+codesign --verify --deep --strict "$app"
+```
+
+Ao substituir a instalação oficial, feche o MonitorControl e guarde uma cópia do app e das preferências. A assinatura local pode exigir uma nova autorização para as teclas de mídia em **Ajustes do Sistema → Privacidade e Segurança → Acessibilidade**. Desative a verificação automática de atualizações na instalação local e recompile o fork quando quiser atualizá-lo.
+
+Para voltar ao app oficial, feche o fork, restaure o app e importe o backup das preferências antes de abri-lo. O app oficial pode apagar as preferências ao detectar um número de build mais novo. Use `defaults import app.monitorcontrol.MonitorControl /caminho/para/preferences.plist`.
 
 ## Verificação
 
