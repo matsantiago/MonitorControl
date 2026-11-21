@@ -167,6 +167,7 @@ enum Command: UInt8 {
   case topRightScreenPurity = 0xE9
   case bottomLeftScreenPurity = 0xEA
   case bottomRightScreenPurity = 0xEB
+  case lgGammaMode = 0xFE
 
   static let brightness = luminance
 }

@@ -28,6 +28,8 @@ Use menubar extra sliders or the keyboard, including native Apple keys!</p>
 
 See [DDC service matching on Apple Silicon](docs/ddc-service-matching.md) for the fix in this fork and local build instructions.
 
+See [Controlling Samsung TVs over the local network](docs/samsung-tv-network.md) for QN90B brightness and volume setup, pairing, and automatic IP rediscovery.
+
 ## Download
 
 Go to [Releases](https://github.com/MonitorControl/MonitorControl/releases) and download the latest `.dmg`, or you can install via Homebrew:

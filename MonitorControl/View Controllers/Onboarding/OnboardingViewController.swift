@@ -17,7 +17,7 @@ class OnboardingViewController: NSViewController {
   }
 
   @IBAction func askForPermissionsButtonTouched(_: NSButton) {
-    app.checkPermissions(firstAsk: true)
+    app.requestMediaKeyAccess()
   }
 
   @IBAction func closeButtonTouched(_: NSButton) {

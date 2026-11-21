@@ -160,13 +160,13 @@ class DisplayManager {
     return false
   }
 
-  func configureDisplays() {
-    self.clearDisplays()
+  func discoverDisplays() -> [Display] {
+    var discovered: [Display] = []
     var onlineDisplayIDs = [CGDirectDisplayID](repeating: 0, count: 16)
     var displayCount: UInt32 = 0
     guard CGGetOnlineDisplayList(16, &onlineDisplayIDs, &displayCount) == .success else {
       os_log("Unable to get display list.", type: .info)
-      return
+      return []
     }
     for onlineDisplayID in onlineDisplayIDs where onlineDisplayID != 0 {
       let name = DisplayManager.getDisplayNameByID(displayID: onlineDisplayID)
@@ -180,22 +180,25 @@ class DisplayManager {
 
         let appleDisplay = AppleDisplay(id, name: name, vendorNumber: vendorNumber, modelNumber: modelNumber, serialNumber: serialNumber, isVirtual: isVirtual, isDummy: isDummy)
         os_log("Apple display found - %{public}@", type: .info, "ID: \(appleDisplay.identifier), Name: \(appleDisplay.name) (Vendor: \(appleDisplay.vendorNumber ?? 0), Model: \(appleDisplay.modelNumber ?? 0))")
-        self.addDisplay(display: appleDisplay)
+        discovered.append(appleDisplay)
       } else {
         let otherDisplay = OtherDisplay(id, name: name, vendorNumber: vendorNumber, modelNumber: modelNumber, serialNumber: serialNumber, isVirtual: isVirtual, isDummy: isDummy)
         os_log("Other display found - %{public}@", type: .info, "ID: \(otherDisplay.identifier), Name: \(otherDisplay.name) (Vendor: \(otherDisplay.vendorNumber ?? 0), Model: \(otherDisplay.modelNumber ?? 0))")
-        self.addDisplay(display: otherDisplay)
+        discovered.append(otherDisplay)
       }
     }
+    return discovered
   }
 
-  func setupOtherDisplays(firstrun: Bool = false) {
+  func setupOtherDisplays(firstrun: Bool, readings: [CGDirectDisplayID: OtherDisplay.StartupReadings]) {
     for otherDisplay in self.getOtherDisplays() {
+      let values = readings[otherDisplay.identifier]?.values ?? [:]
       for command in [Command.audioSpeakerVolume, Command.contrast] where !otherDisplay.readPrefAsBool(key: .unavailableDDC, for: command) && !otherDisplay.isSw() {
-        otherDisplay.setupCurrentAndMaxValues(command: command, firstrun: firstrun)
+        otherDisplay.setupCurrentAndMaxValues(command: command, firstrun: firstrun, readings: values)
       }
-      if (!otherDisplay.isSw() && !otherDisplay.readPrefAsBool(key: .unavailableDDC, for: .brightness)) || otherDisplay.isSw() {
-        otherDisplay.setupCurrentAndMaxValues(command: .brightness, firstrun: firstrun)
+      if !otherDisplay.usesSamsungBrightness,
+         otherDisplay.isSw() || !otherDisplay.readPrefAsBool(key: .unavailableDDC, for: .brightness) {
+        otherDisplay.setupCurrentAndMaxValues(command: .brightness, firstrun: firstrun, readings: values)
         otherDisplay.brightnessSyncSourceValue = otherDisplay.readPrefAsFloat(for: .brightness)
       }
     }
@@ -223,15 +226,15 @@ class DisplayManager {
     self.audioControlTargetDisplays.removeAll()
     os_log("Detecting displays for audio control via audio device name matching...", type: .info)
     var numOfAddedDisplays = 0
-    for ddcCapableDisplay in self.getDdcCapableDisplays() {
-      var displayAudioDeviceName = ddcCapableDisplay.readPrefAsString(key: .audioDeviceNameOverride)
+    for display in self.getOtherDisplays() where display.usesSamsungVolume || display.usesSamsungRemoteVolume || !display.isSw() {
+      var displayAudioDeviceName = display.readPrefAsString(key: .audioDeviceNameOverride)
       if displayAudioDeviceName == "" {
-        displayAudioDeviceName = DisplayManager.getDisplayRawNameByID(displayID: ddcCapableDisplay.identifier)
+        displayAudioDeviceName = DisplayManager.getDisplayRawNameByID(displayID: display.identifier)
       }
       if self.normalizedName(displayAudioDeviceName) == self.normalizedName(deviceName) {
-        self.audioControlTargetDisplays.append(ddcCapableDisplay)
+        self.audioControlTargetDisplays.append(display)
         numOfAddedDisplays += 1
-        os_log("Added display for audio control - %{public}@", type: .info, ddcCapableDisplay.name)
+        os_log("Added display for audio control - %{public}@", type: .info, display.name)
       }
     }
     return numOfAddedDisplays
@@ -333,39 +336,6 @@ class DisplayManager {
     }
   }
 
-  func updateArm64AVServices() {
-    guard Arm64DDC.isArm64 else {
-      return
-    }
-    os_log("arm64 AVService update requested", type: .info)
-    let displays = self.getOtherDisplays()
-    self.globalDDCQueue.sync {
-      let matches = Arm64DDC.getServiceMatches(displayIDs: displays.map(\.identifier))
-      for display in displays {
-        display.arm64avService = nil
-        display.arm64ddc = false
-      }
-      for match in matches {
-        guard let display = displays.first(where: { $0.identifier == match.displayID }) else {
-          continue
-        }
-        display.arm64avService = match.service
-        os_log("Display service match successful for display %{public}@", type: .info, String(match.displayID))
-        if match.discouraged {
-          os_log("Display %{public}@ is flagged as discouraged by Arm64DDC.", type: .info, String(match.displayID))
-          display.isDiscouraged = true
-        } else if match.dummy {
-          os_log("Display %{public}@ is flagged as dummy by Arm64DDC.", type: .info, String(match.displayID))
-          display.isDiscouraged = true
-          display.isDummy = true
-        } else {
-          display.arm64ddc = !DEBUG_SW
-        }
-      }
-    }
-    os_log("AVService update done", type: .info)
-  }
-
   func resetSwBrightnessForAllDisplays(prefsOnly: Bool = false, noPrefSave: Bool = false, async: Bool = false) {
     for otherDisplay in self.getOtherDisplays() {
       if !prefsOnly {
@@ -377,7 +347,7 @@ class DisplayManager {
         otherDisplay.savePref(1, key: .SwBrightness)
         otherDisplay.smoothBrightnessTransient = 1
       }
-      if otherDisplay.isSw(), !noPrefSave {
+      if otherDisplay.isSw(), !otherDisplay.usesSamsungBrightness, !noPrefSave {
         otherDisplay.savePref(1, for: .brightness)
       }
     }
@@ -385,6 +355,10 @@ class DisplayManager {
 
   func restoreSwBrightnessForAllDisplays(async: Bool = false) {
     for otherDisplay in self.getOtherDisplays() {
+      if otherDisplay.usesSamsungBrightness {
+        _ = otherDisplay.setSwBrightness(1)
+        continue
+      }
       if (otherDisplay.readPrefAsFloat(for: .brightness) == 0 && !prefs.bool(forKey: PrefKey.disableCombinedBrightness.rawValue)) || (otherDisplay.readPrefAsFloat(for: .brightness) < otherDisplay.combinedBrightnessSwitchingValue() && !prefs.bool(forKey: PrefKey.separateCombinedScale.rawValue) && !prefs.bool(forKey: PrefKey.disableCombinedBrightness.rawValue)) || otherDisplay.isSw() {
         let savedPrefValue = otherDisplay.readPrefAsFloat(key: .SwBrightness)
         if otherDisplay.getSwBrightness() != savedPrefValue {

@@ -284,26 +284,6 @@ class SliderHandler {
     percentageBox.alphaValue = 0.7
   }
 
-  func valueChangedOtherDisplay(otherDisplay: OtherDisplay, value: Float) {
-    // For the speaker volume slider, also set/unset the mute command when the value is changed from/to 0
-    if self.command == .audioSpeakerVolume, (otherDisplay.readPrefAsInt(for: .audioMuteScreenBlank) == 1 && value > 0) || (otherDisplay.readPrefAsInt(for: .audioMuteScreenBlank) != 1 && value == 0) {
-      otherDisplay.toggleMute(fromVolumeSlider: true)
-    }
-    if self.command == Command.brightness {
-      _ = otherDisplay.setBrightness(value)
-      return
-    } else if !otherDisplay.isSw() {
-      if self.command == Command.audioSpeakerVolume {
-        if !otherDisplay.readPrefAsBool(key: .enableMuteUnmute) || value != 0 {
-          otherDisplay.writeDDCValues(command: self.command, value: otherDisplay.convValueToDDC(for: self.command, from: value))
-        }
-      } else {
-        otherDisplay.writeDDCValues(command: self.command, value: otherDisplay.convValueToDDC(for: self.command, from: value))
-      }
-      otherDisplay.savePref(value, for: self.command)
-    }
-  }
-
   @objc func valueChanged(slider: MCSlider) {
     guard app.sleepID == 0, app.reconfigureID == 0 else {
       return
@@ -328,7 +308,7 @@ class SliderHandler {
       if self.command == .brightness, let appleDisplay = display as? AppleDisplay {
         _ = appleDisplay.setBrightness(value)
       } else if let otherDisplay = display as? OtherDisplay {
-        self.valueChangedOtherDisplay(otherDisplay: otherDisplay, value: value)
+        otherDisplay.setSliderValue(value, for: self.command)
       }
     }
     slider.setDisplayHighlightItems(false)

@@ -3,7 +3,6 @@
 import AVFoundation
 import Cocoa
 import Foundation
-import MediaKeyTap
 import os.log
 import ServiceManagement
 import Settings
@@ -24,6 +23,14 @@ class AppDelegate: NSObject, NSApplicationDelegate {
   var statusItemObserver: NSObjectProtocol!
   var statusItemVisibilityChangedByUser = true
   var reconfigureID: Int = 0 // dispatched reconfigure command ID
+  private var generation = 0
+  private var configurationWork: DispatchWorkItem?
+  private var pendingFirstRun = false
+  private var restoreAfterWake = false
+  private var serviceObserver: DDCServiceObserver?
+  private var changedDuringProbe = Set<CGDirectDisplayID>()
+  private var recoveryDelays: [CGDirectDisplayID: Int] = [:]
+  private var recoveryWork: [CGDirectDisplayID: DispatchWorkItem] = [:]
   var sleepID: Int = 0 // sleep event ID
   var safeMode = false
   var jobRunning = false
@@ -57,13 +64,18 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     self.showSafeModeAlertIfNeeded()
     if !prefs.bool(forKey: PrefKey.appAlreadyLaunched.rawValue) {
       self.showOnboardingWindow()
-    } else {
-      self.checkPermissions()
     }
     self.setPrefsBuildNumber()
     self.setDefaultPrefs()
     self.setMenu()
-    CGDisplayRegisterReconfigurationCallback({ _, _, _ in app.displayReconfigured() }, nil)
+    CGDisplayRegisterReconfigurationCallback({ _, _, _ in
+      DispatchQueue.main.async { app.displayReconfigured() }
+    }, nil)
+    if Arm64DDC.isArm64 {
+      self.serviceObserver = DDCServiceObserver { [weak self] added, registryIDs in
+        self?.ddcServicesChanged(added: added, registryIDs: registryIDs)
+      }
+    }
     self.configure(firstrun: true)
     DisplayManager.shared.createGammaActivityEnforcer()
     self.updaterController.startUpdater()
@@ -135,12 +147,16 @@ class AppDelegate: NSObject, NSApplicationDelegate {
   }
 
   @objc func displayReconfigured() {
-    DisplayManager.shared.resetSwBrightnessForAllDisplays(noPrefSave: true)
-    CGDisplayRestoreColorSyncSettings()
-    self.reconfigureID += 1
+    let firstChange = self.reconfigureID == 0
+    self.invalidateDiscovery()
+    self.reconfigureID = self.generation
     self.updateMediaKeyTap()
     os_log("Bumping reconfigureID to %{public}@", type: .info, String(self.reconfigureID))
-    _ = DisplayManager.shared.destroyAllShades()
+    if firstChange {
+      DisplayManager.shared.resetSwBrightnessForAllDisplays(noPrefSave: true)
+      CGDisplayRestoreColorSyncSettings()
+      _ = DisplayManager.shared.destroyAllShades()
+    }
     if self.sleepID == 0 {
       let dispatchedReconfigureID = self.reconfigureID
       os_log("Display to be reconfigured with reconfigureID %{public}@", type: .info, String(dispatchedReconfigureID))
@@ -150,20 +166,68 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
   }
 
-  func configure(dispatchedReconfigureID: Int = 0, firstrun: Bool = false) {
-    guard self.sleepID == 0, dispatchedReconfigureID == self.reconfigureID else {
-      return
+  private func invalidateDiscovery() {
+    self.generation += 1
+    self.configurationWork?.cancel()
+    for work in self.recoveryWork.values { work.cancel() }
+    self.recoveryWork.removeAll()
+    self.recoveryDelays.removeAll()
+    self.changedDuringProbe.removeAll()
+  }
+
+  func configure(dispatchedReconfigureID: Int? = nil, firstrun: Bool = false) {
+    guard self.sleepID == 0, dispatchedReconfigureID == nil || dispatchedReconfigureID == self.reconfigureID else { return }
+    self.invalidateDiscovery()
+    let generation = self.generation
+    self.reconfigureID = generation
+    self.pendingFirstRun = self.pendingFirstRun || firstrun
+    self.updateMediaKeyTap()
+    let manager = DisplayManager.shared
+    let displays = manager.discoverDisplays()
+    if manager.displays.isEmpty {
+      manager.displays = displays
+      menu.updateMenus()
     }
-    os_log("Request for configuration with reconfigreID %{public}@", type: .info, String(dispatchedReconfigureID))
-    self.reconfigureID = 0
+    menu.refreshMonitorSettings()
+    let external = displays.compactMap { $0 as? OtherDisplay }
+    let safeMode = self.safeMode
+    let work = DispatchWorkItem {
+      let matches = Arm64DDC.isArm64 && !safeMode ? Arm64DDC.getServiceMatches(displayIDs: external.map(\.identifier)) : []
+      var readings: [CGDirectDisplayID: OtherDisplay.StartupReadings] = [:]
+      for display in external {
+        let match = matches.first { $0.displayID == display.identifier }
+        readings[display.identifier] = display.readForConfiguration(match: match, safeMode: safeMode)
+      }
+      DispatchQueue.main.async {
+        guard self.generation == generation, self.sleepID == 0 else { return }
+        for display in external {
+          if let reading = readings[display.identifier] {
+            display.applyConfiguration(match: matches.first { $0.displayID == display.identifier }, readings: reading)
+          }
+        }
+        manager.displays = displays
+        manager.addDisplayCounterSuffixes()
+        self.reconfigureID = 0
+        self.configurationWork = nil
+        let first = self.pendingFirstRun
+        self.pendingFirstRun = false
+        self.finishConfiguration(firstrun: first, readings: readings)
+        for display in external where readings[display.identifier]?.transportFailed == true ||
+          (display.canOpenMonitorSettings && !display.arm64ddc) {
+          self.recoverDDC(for: display)
+        }
+      }
+    }
+    self.configurationWork = work
+    manager.globalDDCQueue.async(execute: work)
+  }
+
+  private func finishConfiguration(firstrun: Bool, readings: [CGDirectDisplayID: OtherDisplay.StartupReadings]) {
     DisplayManager.shared.gammaInterferenceCounter = 0
-    DisplayManager.shared.configureDisplays()
-    DisplayManager.shared.addDisplayCounterSuffixes()
-    DisplayManager.shared.updateArm64AVServices()
     if firstrun && prefs.integer(forKey: PrefKey.startupAction.rawValue) != StartupAction.write.rawValue {
       DisplayManager.shared.resetSwBrightnessForAllDisplays(prefsOnly: true)
     }
-    DisplayManager.shared.setupOtherDisplays(firstrun: firstrun)
+    DisplayManager.shared.setupOtherDisplays(firstrun: firstrun, readings: readings)
     self.updateMenusAndKeys()
     if !firstrun || prefs.integer(forKey: PrefKey.startupAction.rawValue) == StartupAction.write.rawValue {
       if !prefs.bool(forKey: PrefKey.disableCombinedBrightness.rawValue) {
@@ -171,7 +235,81 @@ class AppDelegate: NSObject, NSApplicationDelegate {
       }
     }
     displaysPrefsVc?.loadDisplayList()
+    menu.refreshMonitorSettings()
     self.job(start: true)
+    if self.restoreAfterWake {
+      self.restoreAfterWake = false
+      self.startupActionWriteRepeatAfterSober()
+    }
+  }
+
+  private func ddcServicesChanged(added: Bool, registryIDs: Set<UInt64>) {
+    guard self.sleepID == 0, self.reconfigureID == 0 else { return }
+    for display in DisplayManager.shared.getOtherDisplays() {
+      let id = display.identifier
+      if added && display.transportUnavailable {
+        if self.recoveryWork[id] != nil && self.recoveryDelays[id] == nil {
+          self.changedDuringProbe.insert(id)
+        } else {
+          self.recoverDDC(for: display, immediately: true)
+        }
+      } else if !added, let current = display.arm64RegistryID, registryIDs.contains(current) {
+        self.recoverDDC(for: display, immediately: true)
+      }
+    }
+  }
+
+  func recoverDDC(for display: OtherDisplay, immediately: Bool = false) {
+    let id = display.identifier
+    let manager = DisplayManager.shared
+    guard Arm64DDC.isArm64, !self.safeMode, self.reconfigureID == 0, self.sleepID == 0,
+          !display.isVirtual, !display.isDummy, display.samsungTV == nil,
+          !display.readPrefAsBool(key: .forceSw),
+          manager.displays.contains(where: { $0 === display }) else { return }
+    let wasUnavailable = display.transportUnavailable
+    display.transportUnavailable = true
+    if self.recoveryWork[id] != nil {
+      // A manual refresh may skip backoff but never duplicates a running probe.
+      guard immediately, self.recoveryDelays[id] != nil else { return }
+      self.recoveryWork[id]?.cancel()
+    }
+    let interval = self.recoveryDelays[id] ?? 2
+    self.recoveryDelays[id] = interval
+    let generation = self.generation
+    let ids = manager.getOtherDisplays().map(\.identifier)
+    let work = DispatchWorkItem {
+      self.recoveryDelays[id] = nil
+      manager.globalDDCQueue.async {
+        display.releaseFailedDDCService()
+        let candidates = Arm64DDC.recoveryCandidates(for: id, among: ids)
+        let recovered = display.reopenDDC(candidates: candidates)
+        DispatchQueue.main.async {
+          guard generation == self.generation else { return }
+          self.recoveryWork[id] = nil
+          let newServiceArrived = self.changedDuringProbe.remove(id) != nil
+          if let recovered {
+            display.transportUnavailable = false
+            display.markDDCRecovered(registryID: recovered)
+            os_log("DDC recovered for display %{public}u", type: .info, id)
+            self.updateMenusAndKeys()
+            menu.refreshMonitorSettings()
+          } else {
+            self.recoveryDelays[id] = min(interval * 2, 60)
+            os_log("DDC unavailable for display %{public}u after checking %{public}d candidate(s), retry in %{public}d s", type: .info, id, candidates.count, self.recoveryDelays[id] ?? 60)
+            self.recoverDDC(for: display, immediately: newServiceArrived)
+          }
+        }
+      }
+    }
+    self.recoveryWork[id] = work
+    if !wasUnavailable { menu.refreshMonitorSettings() }
+    DispatchQueue.main.asyncAfter(deadline: .now() + (immediately ? 0 : Double(interval)), execute: work)
+  }
+
+  func retryMonitorSettings(for display: OtherDisplay) -> Bool {
+    guard self.recoveryWork[display.identifier] != nil else { return false }
+    self.recoverDDC(for: display, immediately: true)
+    return true
   }
 
   func updateMenusAndKeys() {
@@ -180,10 +318,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     self.updateMediaKeyTap()
   }
 
-  func checkPermissions(firstAsk: Bool = false) {
+  func requestMediaKeyAccess() {
     let permissionsRequired: Bool = [KeyboardVolume.media.rawValue, KeyboardVolume.both.rawValue].contains(prefs.integer(forKey: PrefKey.keyboardVolume.rawValue)) || [KeyboardBrightness.media.rawValue, KeyboardBrightness.both.rawValue].contains(prefs.integer(forKey: PrefKey.keyboardBrightness.rawValue))
     if !MediaKeyTapManager.readPrivileges(prompt: false), permissionsRequired {
-      MediaKeyTapManager.acquirePrivileges(firstAsk: firstAsk)
+      _ = MediaKeyTapManager.readPrivileges(prompt: true)
     }
   }
 
@@ -199,6 +337,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
   }
 
   @objc private func sleepNotification() {
+    self.invalidateDiscovery()
     self.sleepID += 1
     os_log("Sleeping with sleep %{public}@", type: .info, String(self.sleepID))
     self.updateMediaKeyTap()
@@ -218,16 +357,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     if self.sleepID == dispatchedSleepID {
       os_log("Sober from sleep %{public}@", type: .info, String(self.sleepID))
       self.sleepID = 0
-      if self.reconfigureID != 0 {
-        let dispatchedReconfigureID = self.reconfigureID
-        os_log("Displays need reconfig after sober with reconfigureID %{public}@", type: .info, String(dispatchedReconfigureID))
-        self.configure(dispatchedReconfigureID: dispatchedReconfigureID)
-      } else if Arm64DDC.isArm64 {
-        os_log("Displays don't need reconfig after sober but might need AVServices update", type: .info)
-        DisplayManager.shared.updateArm64AVServices()
-        self.job(start: true)
-      }
-      self.startupActionWriteRepeatAfterSober()
+      self.restoreAfterWake = true
+      self.configure()
       self.updateMediaKeyTap()
     }
   }
@@ -259,6 +390,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
       }
       var refreshedSomething = false
       for display in DisplayManager.shared.displays {
+        if let otherDisplay = display as? OtherDisplay {
+          otherDisplay.samsungTV?.refreshIfNeeded()
+          if otherDisplay.usesSamsungBrightness { continue }
+        }
         let delta = display.refreshBrightness()
         if delta != 0 {
           refreshedSomething = true
@@ -284,11 +419,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
   }
 
-  func handleListenForChanged() {
-    self.checkPermissions()
-    self.updateMediaKeyTap()
-  }
-
   func settingsReset() {
     os_log("Resetting all settings.")
     if !prefs.bool(forKey: PrefKey.disableCombinedBrightness.rawValue) {
@@ -299,7 +429,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
     app.updateStatusItemVisibility(true)
     self.setDefaultPrefs()
-    self.checkPermissions()
     self.updateMediaKeyTap()
     self.configure(firstrun: true)
   }
@@ -313,7 +442,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
   }
 
   func updateMediaKeyTap() {
-    MediaKeyTap.useAlternateBrightnessKeys = !prefs.bool(forKey: PrefKey.disableAltBrightnessKeys.rawValue)
     self.mediaKeyTap.updateMediaKeyTap()
   }
 

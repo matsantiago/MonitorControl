@@ -224,12 +224,18 @@ class KeyboardPrefsViewController: NSViewController, SettingsPane {
 
   @IBAction func keyboardBrightness(_ sender: NSPopUpButton) {
     prefs.set(sender.selectedTag(), forKey: PrefKey.keyboardBrightness.rawValue)
+    if [KeyboardBrightness.media.rawValue, KeyboardBrightness.both.rawValue].contains(sender.selectedTag()) {
+      app.requestMediaKeyAccess()
+    }
     app.updateMenusAndKeys()
     self.updateGridLayout()
   }
 
   @IBAction func keyboardVolume(_ sender: NSPopUpButton) {
     prefs.set(sender.selectedTag(), forKey: PrefKey.keyboardVolume.rawValue)
+    if [KeyboardVolume.media.rawValue, KeyboardVolume.both.rawValue].contains(sender.selectedTag()) {
+      app.requestMediaKeyAccess()
+    }
     app.updateMenusAndKeys()
     self.updateGridLayout()
   }

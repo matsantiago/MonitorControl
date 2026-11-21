@@ -5,6 +5,7 @@ import os.log
 
 class MenuHandler: NSMenu, NSMenuDelegate {
   var combinedSliderHandler: [Command: SliderHandler] = [:]
+  private var monitorSettings: MonitorSettingsWindowController?
 
   var lastMenuRelevantDisplayId: CGDirectDisplayID = 0
 
@@ -19,7 +20,19 @@ class MenuHandler: NSMenu, NSMenuDelegate {
     self.combinedSliderHandler.removeAll()
   }
 
+  private var menuIsOpen = false
+  private var updateAfterClosing = false
+
+  func menuDidClose(_: NSMenu) {
+    self.menuIsOpen = false
+    if self.updateAfterClosing {
+      self.updateAfterClosing = false
+      DispatchQueue.main.async { self.updateMenus() }
+    }
+  }
+
   func menuWillOpen(_: NSMenu) {
+    self.menuIsOpen = true
     self.updateMenuRelevantDisplay()
     app.keyboardShortcuts.disengage()
   }
@@ -30,8 +43,9 @@ class MenuHandler: NSMenu, NSMenuDelegate {
 
   func updateMenus(dontClose: Bool = false) {
     os_log("Menu update initiated", type: .info)
-    if !dontClose {
-      self.cancelTrackingWithoutAnimation()
+    if self.menuIsOpen, !dontClose {
+      self.updateAfterClosing = true
+      return
     }
     let menuIconPref = prefs.integer(forKey: PrefKey.menuIcon.rawValue)
     var showIcon = false
@@ -47,7 +61,7 @@ class MenuHandler: NSMenu, NSMenuDelegate {
     }
     app.updateStatusItemVisibility(showIcon)
     self.clearMenu()
-    let currentDisplay = DisplayManager.shared.getCurrentDisplay()
+    let currentDisplay = DisplayManager.shared.getCurrentDisplay() ?? DisplayManager.shared.displays.first
     var displays: [Display] = []
     if !prefs.bool(forKey: PrefKey.hideAppleFromMenu.rawValue) {
       displays.append(contentsOf: DisplayManager.shared.getAppleDisplays())
@@ -180,9 +194,13 @@ class MenuHandler: NSMenu, NSMenuDelegate {
     let monitorSubMenu: NSMenu = asSubMenu ? NSMenu() : self
     var addedSliderHandlers: [SliderHandler] = []
     display.sliderHandler[.audioSpeakerVolume] = nil
-    if let otherDisplay = display as? OtherDisplay, !otherDisplay.isSw(), !display.readPrefAsBool(key: .unavailableDDC, for: .audioSpeakerVolume), !prefs.bool(forKey: PrefKey.hideVolume.rawValue) {
+    if let otherDisplay = display as? OtherDisplay, !prefs.bool(forKey: PrefKey.hideVolume.rawValue) {
       let title = NSLocalizedString("Volume", comment: "Shown in menu")
-      addedSliderHandlers.append(self.setupMenuSliderHandler(command: .audioSpeakerVolume, display: display, title: title))
+      if otherDisplay.usesSamsungRemoteVolume {
+        self.addSamsungVolumeMenu(to: monitorSubMenu, display: otherDisplay, title: title)
+      } else if otherDisplay.supportsVolume {
+        addedSliderHandlers.append(self.setupMenuSliderHandler(command: .audioSpeakerVolume, display: display, title: title))
+      }
     }
     display.sliderHandler[.contrast] = nil
     if let otherDisplay = display as? OtherDisplay, !otherDisplay.isSw(), !display.readPrefAsBool(key: .unavailableDDC, for: .contrast), prefs.bool(forKey: PrefKey.showContrast.rawValue) {
@@ -190,16 +208,62 @@ class MenuHandler: NSMenu, NSMenuDelegate {
       addedSliderHandlers.append(self.setupMenuSliderHandler(command: .contrast, display: display, title: title))
     }
     display.sliderHandler[.brightness] = nil
-    if !display.readPrefAsBool(key: .unavailableDDC, for: .brightness), !prefs.bool(forKey: PrefKey.hideBrightness.rawValue) {
+    if (display as? OtherDisplay)?.usesSamsungBrightness == true || !display.readPrefAsBool(key: .unavailableDDC, for: .brightness),
+       !prefs.bool(forKey: PrefKey.hideBrightness.rawValue) {
       let title = NSLocalizedString("Brightness", comment: "Shown in menu")
       addedSliderHandlers.append(self.setupMenuSliderHandler(command: .brightness, display: display, title: title))
+    }
+    let showsMonitorSettings = (display as? OtherDisplay)?.canOpenMonitorSettings == true
+    if showsMonitorSettings {
+      let title = NSLocalizedString("Monitor Settings…", comment: "Opens the monitor settings window")
+      let friendlyName = display.readPrefAsString(key: .friendlyName)
+      let item = NSMenuItem(title: asSubMenu ? title : "\(friendlyName.isEmpty ? display.name : friendlyName) — \(title)", action: #selector(self.openMonitorSettings(_:)), keyEquivalent: "")
+      item.target = self
+      item.representedObject = display
+      monitorSubMenu.insertItem(item, at: 0)
     }
     if prefs.integer(forKey: PrefKey.multiSliders.rawValue) != MultiSliders.combine.rawValue {
       self.addDisplayMenuBlock(addedSliderHandlers: addedSliderHandlers, blockName: display.readPrefAsString(key: .friendlyName) != "" ? display.readPrefAsString(key: .friendlyName) : display.name, monitorSubMenu: monitorSubMenu, numOfDisplays: numOfDisplays, asSubMenu: asSubMenu)
     }
-    if addedSliderHandlers.count > 0, prefs.integer(forKey: PrefKey.menuIcon.rawValue) == MenuIcon.sliderOnly.rawValue {
+    if (!addedSliderHandlers.isEmpty || showsMonitorSettings || ((display as? OtherDisplay)?.usesSamsungRemoteVolume == true && !prefs.bool(forKey: PrefKey.hideVolume.rawValue))),
+       prefs.integer(forKey: PrefKey.menuIcon.rawValue) == MenuIcon.sliderOnly.rawValue {
       app.updateStatusItemVisibility(true)
     }
+  }
+
+  @objc private func openMonitorSettings(_ sender: NSMenuItem) {
+    guard let display = sender.representedObject as? OtherDisplay else { return }
+    let controller = self.monitorSettings ?? MonitorSettingsWindowController()
+    self.monitorSettings = controller
+    controller.show(for: display)
+  }
+
+  func refreshMonitorSettings() {
+    self.monitorSettings?.refreshIfVisible()
+  }
+
+  private func addSamsungVolumeMenu(to menu: NSMenu, display: OtherDisplay, title: String) {
+    let displayName = display.readPrefAsString(key: .friendlyName)
+    let item = NSMenuItem()
+    item.title = "\(title) — \(displayName.isEmpty ? display.name : displayName)"
+    let submenu = NSMenu()
+    let actions: [(String, SamsungTVRemoteKey)] = [
+      (NSLocalizedString("Volume Up", comment: "Samsung TV menu command"), .volumeUp),
+      (NSLocalizedString("Volume Down", comment: "Samsung TV menu command"), .volumeDown),
+      (NSLocalizedString("Mute", comment: "Samsung TV menu command"), .mute),
+    ]
+    for (title, key) in actions {
+      let action = submenu.addItem(withTitle: title, action: #selector(self.sendSamsungVolumeKey(_:)), keyEquivalent: "")
+      action.target = self
+      action.representedObject = (display, key)
+    }
+    item.submenu = submenu
+    menu.insertItem(item, at: 0)
+  }
+
+  @objc private func sendSamsungVolumeKey(_ item: NSMenuItem) {
+    guard let (display, key) = item.representedObject as? (OtherDisplay, SamsungTVRemoteKey) else { return }
+    display.samsungTV?.press(key)
   }
 
   private func appendMenuHeader(friendlyName: String, monitorSubMenu: NSMenu, asSubMenu: Bool, numOfDisplays: Int) {

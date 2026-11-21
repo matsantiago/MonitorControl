@@ -6,24 +6,23 @@ import Foundation
 import MediaKeyTap
 import os.log
 
-class MediaKeyTapManager: MediaKeyTapDelegate {
-  var mediaKeyTap: MediaKeyTap?
+class MediaKeyTapManager {
+  private var mediaKeyTap: MonitorMediaKeyTap?
+  private var tapGeneration = 0
   var keyRepeatTimers: [MediaKey: Timer] = [:]
 
-  func handle(mediaKey: MediaKey, event: KeyEvent?, modifiers: NSEvent.ModifierFlags?) {
-    let isPressed = event?.keyPressed ?? true
-    let isRepeat = event?.keyRepeat ?? false
-    let isControl = modifiers?.isSuperset(of: NSEvent.ModifierFlags([.control])) ?? false
-    let isCommand = modifiers?.isSuperset(of: NSEvent.ModifierFlags([.command])) ?? false
-    let isOption = modifiers?.isSuperset(of: NSEvent.ModifierFlags([.option])) ?? false
-    let isShift = modifiers?.isSuperset(of: NSEvent.ModifierFlags([.shift])) ?? false
+  private func handle(mediaKey: MediaKey, isPressed: Bool, isRepeat: Bool, modifiers: NSEvent.ModifierFlags) {
+    let isControl = modifiers.contains(.control)
+    let isCommand = modifiers.contains(.command)
+    let isOption = modifiers.contains(.option)
+    let isShift = modifiers.contains(.shift)
     if isPressed, isCommand, !isControl, mediaKey == .brightnessDown, DisplayManager.engageMirror() {
       return
     }
     guard app.sleepID == 0, app.reconfigureID == 0 else {
       return
     }
-    if isPressed, self.handleOpenPrefPane(mediaKey: mediaKey, event: event, modifiers: modifiers) {
+    if isPressed, !isRepeat, self.handleOpenPrefPane(mediaKey: mediaKey, modifiers: modifiers) {
       return
     }
     var isSmallIncrement = isOption && isShift
@@ -146,6 +145,11 @@ class MediaKeyTapManager: MediaKeyTapDelegate {
   }
 
   func updateMediaKeyTap() {
+    self.tapGeneration += 1
+    self.mediaKeyTap = nil
+    guard app.sleepID == 0, app.reconfigureID == 0, !app.safeMode, Self.readPrivileges(prompt: false) else {
+      return
+    }
     var keys: [MediaKey] = []
     if [KeyboardBrightness.media.rawValue, KeyboardBrightness.both.rawValue].contains(prefs.integer(forKey: PrefKey.keyboardBrightness.rawValue)) {
       keys.append(contentsOf: [.brightnessUp, .brightnessDown])
@@ -157,10 +161,6 @@ class MediaKeyTapManager: MediaKeyTapDelegate {
     var disengageBrightness = true
     for display in DisplayManager.shared.getAllDisplays() where !display.isBuiltIn() {
       disengageBrightness = false
-    }
-    // Disengage brightness keys on sleep so MacBook native screen can be controlled meanwhile
-    if app.sleepID != 0 || app.reconfigureID != 0 {
-      disengageBrightness = true
     }
     if disengageBrightness, !prefs.bool(forKey: PrefKey.useFineScaleBrightness.rawValue) {
       let keysToDelete: [MediaKey] = [.brightnessUp, .brightnessDown]
@@ -177,20 +177,16 @@ class MediaKeyTapManager: MediaKeyTapDelegate {
         keys.removeAll { keysToDelete.contains($0) }
       }
     }
-    self.mediaKeyTap?.stop()
-    // returning an empty array listens for all mediakeys in MediaKeyTap
-    if keys.count > 0 {
-      self.mediaKeyTap = MediaKeyTap(delegate: self, on: KeyPressMode.keyDownAndUp, for: keys, observeBuiltIn: true)
-      self.mediaKeyTap?.start()
+    guard !keys.isEmpty else { return }
+    let generation = self.tapGeneration
+    self.mediaKeyTap = MonitorMediaKeyTap(keys: Set(keys), alternateBrightness: !prefs.bool(forKey: PrefKey.disableAltBrightnessKeys.rawValue)) { [weak self] key, isPressed, isRepeat, modifiers in
+      guard let self, self.tapGeneration == generation else { return }
+      self.handle(mediaKey: key, isPressed: isPressed, isRepeat: isRepeat, modifiers: modifiers)
     }
   }
 
-  func handleOpenPrefPane(mediaKey: MediaKey, event: KeyEvent?, modifiers: NSEvent.ModifierFlags?) -> Bool {
-    guard let modifiers = modifiers else { return false }
+  private func handleOpenPrefPane(mediaKey: MediaKey, modifiers: NSEvent.ModifierFlags) -> Bool {
     if !(modifiers.contains(.option) && !modifiers.contains(.shift) && !modifiers.contains(.control) && !modifiers.contains(.command)) {
-      return false
-    }
-    if event?.keyRepeat == true {
       return false
     }
     switch mediaKey {
@@ -204,19 +200,86 @@ class MediaKeyTapManager: MediaKeyTapDelegate {
     return true
   }
 
-  static func acquirePrivileges(firstAsk: Bool = false) {
-    if !self.readPrivileges(prompt: true), !firstAsk {
-      let alert = NSAlert()
-      alert.messageText = NSLocalizedString("Shortcuts not available", comment: "Shown in the alert dialog")
-      alert.informativeText = NSLocalizedString("You need to enable MonitorControl in System Settings > Security and Privacy > Accessibility for the keyboard shortcuts to work", comment: "Shown in the alert dialog")
-      alert.runModal()
+  static func readPrivileges(prompt: Bool) -> Bool {
+    let status = prompt ? AXIsProcessTrustedWithOptions([kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary) : AXIsProcessTrusted()
+    os_log("Reading Accessibility privileges - Current access status %{public}@", type: .info, String(status))
+    return status
+  }
+}
+
+private final class MonitorMediaKeyTap {
+  private let port: CFMachPort
+  private let source: CFRunLoopSource
+
+  private final class Context {
+    let keys: Set<MediaKey>
+    let alternateBrightness: Bool
+    let onMediaKey: (MediaKey, Bool, Bool, NSEvent.ModifierFlags) -> Void
+
+    init(keys: Set<MediaKey>, alternateBrightness: Bool, onMediaKey: @escaping (MediaKey, Bool, Bool, NSEvent.ModifierFlags) -> Void) {
+      self.keys = keys
+      self.alternateBrightness = alternateBrightness
+      self.onMediaKey = onMediaKey
+    }
+
+    func process(_ event: CGEvent, type: CGEventType) -> Unmanaged<CGEvent>? {
+      let key: MediaKey?
+      let isPressed: Bool
+      let isRepeat: Bool
+      switch type {
+      case .keyDown:
+        switch event.getIntegerValueField(.keyboardEventKeycode) {
+        case 107 where self.alternateBrightness, 145: key = .brightnessDown
+        case 113 where self.alternateBrightness, 144: key = .brightnessUp
+        default: key = nil
+        }
+        isPressed = true
+        isRepeat = false
+      case let type where type.rawValue == UInt32(NX_SYSDEFINED):
+        guard let systemEvent = NSEvent(cgEvent: event), systemEvent.subtype.rawValue == 8 else {
+          return .passUnretained(event)
+        }
+        key = MediaKeyTap.keycodeToMediaKey(Int32((systemEvent.data1 >> 16) & 0xffff))
+        isPressed = (systemEvent.data1 & 0xff00) == 0x0a00
+        isRepeat = (systemEvent.data1 & 1) != 0
+      default:
+        return .passUnretained(event)
+      }
+      guard let key, self.keys.contains(key) else { return .passUnretained(event) }
+      let modifiers = NSEvent.ModifierFlags(rawValue: UInt(event.flags.rawValue))
+      // Return to WindowServer immediately, even when a display operation blocks AppKit.
+      DispatchQueue.main.async { self.onMediaKey(key, isPressed, isRepeat, modifiers) }
+      return nil
     }
   }
 
-  static func readPrivileges(prompt: Bool) -> Bool {
-    let options: NSDictionary = [kAXTrustedCheckOptionPrompt.takeRetainedValue() as NSString: prompt]
-    let status = AXIsProcessTrustedWithOptions(options)
-    os_log("Reading Accessibility privileges - Current access status %{public}@", type: .info, String(status))
-    return status
+  init?(keys: Set<MediaKey>, alternateBrightness: Bool, onMediaKey: @escaping (MediaKey, Bool, Bool, NSEvent.ModifierFlags) -> Void) {
+    let context = Context(keys: keys, alternateBrightness: alternateBrightness, onMediaKey: onMediaKey)
+    let keyDownMask = keys.contains(.brightnessUp) || keys.contains(.brightnessDown) ? CGEventMask(1) << CGEventType.keyDown.rawValue : 0
+    guard let port = CGEvent.tapCreate(tap: .cgSessionEventTap, place: .headInsertEventTap, options: .defaultTap,
+                                       eventsOfInterest: keyDownMask | (CGEventMask(1) << NX_SYSDEFINED), callback: { _, type, event, info in
+      guard let info else { return .passUnretained(event) }
+      return Unmanaged<Context>.fromOpaque(info).takeUnretainedValue().process(event, type: type)
+    }, userInfo: Unmanaged.passUnretained(context).toOpaque()) else { return nil }
+    guard let source = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, port, 0) else {
+      CFMachPortInvalidate(port)
+      return nil
+    }
+    self.port = port
+    self.source = source
+    DispatchQueue(label: "MonitorControl media keys", qos: .userInteractive).async {
+      withExtendedLifetime(context) {
+        CFRunLoopAddSource(CFRunLoopGetCurrent(), source, .defaultMode)
+        while CFRunLoopSourceIsValid(source) {
+          CFRunLoopRunInMode(.defaultMode, 1, false)
+        }
+      }
+    }
+  }
+
+  deinit {
+    CGEvent.tapEnable(tap: self.port, enable: false)
+    CFMachPortInvalidate(self.port)
+    CFRunLoopSourceInvalidate(self.source)
   }
 }

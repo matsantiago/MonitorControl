@@ -7,8 +7,29 @@ import os.log
 class OtherDisplay: Display {
   var ddc: IntelDDC?
   var arm64ddc: Bool = false
-  var arm64avService: IOAVService?
+  private var arm64avService: IOAVService?
+  private(set) var arm64RegistryID: UInt64?
+  var transportUnavailable = false
   var isDiscouraged: Bool = false
+  var samsungTV: SamsungTVControl?
+  private(set) var samsungDDCResponds: Bool?
+  private var isSamsungDisplay: Bool {
+    // EDID manufacturer code "SAM".
+    self.vendorNumber == 0x4C2D && !self.isVirtual && !self.isDummy
+  }
+  var canDiscoverSamsungTV: Bool {
+    self.isSamsungDisplay && self.samsungTV == nil && self.samsungDDCResponds == false
+  }
+  var usesSamsungBrightness: Bool { self.samsungTV?.binding.hasBrightness == true }
+  var usesSamsungVolume: Bool { self.samsungTV?.binding.hasVolume == true }
+  var usesSamsungRemoteVolume: Bool { !self.usesSamsungVolume && self.samsungTV?.binding.usesRemoteVolume == true }
+  var supportsVolume: Bool {
+    self.usesSamsungVolume || (!self.isSw() && !self.readPrefAsBool(key: .unavailableDDC, for: .audioSpeakerVolume))
+  }
+  var canOpenMonitorSettings: Bool {
+    // EDID manufacturer code "GSM" (LG Electronics).
+    self.vendorNumber == 0x1E6D && !self.isDummy && !self.isVirtual && !self.readPrefAsBool(key: .forceSw) && !app.safeMode
+  }
   let writeDDCQueue = DispatchQueue(label: "Local write DDC queue")
   var writeDDCNextValue: [Command: UInt16] = [:]
   var writeDDCLastSavedValue: [Command: UInt16] = [:]
@@ -30,6 +51,9 @@ class OtherDisplay: Display {
     super.init(identifier, name: name, vendorNumber: vendorNumber, modelNumber: modelNumber, serialNumber: serialNumber, isVirtual: isVirtual, isDummy: isDummy)
     if !isVirtual, !Arm64DDC.isArm64 {
       self.ddc = IntelDDC(for: identifier)
+    }
+    if let binding = SamsungTVBinding.load(for: self) {
+      self.samsungTV = SamsungTVControl(display: self, binding: binding)
     }
   }
 
@@ -88,8 +112,8 @@ class OtherDisplay: Display {
     }
   }
 
-  func setupCurrentAndMaxValues(command: Command, firstrun: Bool = false) {
-    var ddcValues: (UInt16, UInt16)?
+  func setupCurrentAndMaxValues(command: Command, firstrun: Bool, readings: [Command: DDCValue]) {
+    let ddcValues = readings[command]
     var maxDDCValue = UInt16(DDC_MAX_DETECT_LIMIT)
     var currentDDCValue: UInt16
     switch command {
@@ -102,26 +126,13 @@ class OtherDisplay: Display {
     }
     os_log("Setting up display %{public}@ for %{public}@", type: .info, String(self.identifier), String(reflecting: command))
     if !self.isSw() {
-      if prefs.integer(forKey: PrefKey.startupAction.rawValue) == StartupAction.read.rawValue, self.pollingCount != 0, !app.safeMode {
-        os_log("- Reading DDC from display %{public}@ times", type: .info, String(self.pollingCount))
-        let delay = self.readPrefAsBool(key: .longerDelay) ? UInt64(40 * kMillisecondScale) : nil
-        ddcValues = self.readDDCValues(for: command, tries: UInt(self.pollingCount), minReplyDelay: delay)
-        if ddcValues != nil {
-          (currentDDCValue, maxDDCValue) = ddcValues ?? (currentDDCValue, maxDDCValue)
-          self.processCurrentDDCValue(isReadFromDisplay: true, command: command, firstrun: firstrun, currentDDCValue: currentDDCValue)
-          os_log("- DDC read successful.", type: .info)
-        } else {
-          os_log("- DDC read failed.", type: .info)
-        }
-      } else {
-        os_log("- DDC read disabled.", type: .info)
+      if let ddcValues {
+        (currentDDCValue, maxDDCValue) = ddcValues
       }
-      if self.readPrefAsInt(key: .maxDDCOverride, for: command) > self.readPrefAsInt(key: .minDDCOverride, for: command) {
-        self.savePref(self.readPrefAsInt(key: .maxDDCOverride, for: command), key: .maxDDC, for: command)
+      self.updateMaximum(for: command, reported: maxDDCValue)
+      if ddcValues != nil {
+        self.processCurrentDDCValue(isReadFromDisplay: true, command: command, firstrun: firstrun, currentDDCValue: currentDDCValue)
       } else {
-        self.savePref(min(Int(maxDDCValue), DDC_MAX_DETECT_LIMIT), key: .maxDDC, for: command)
-      }
-      if ddcValues == nil {
         self.processCurrentDDCValue(isReadFromDisplay: false, command: command, firstrun: firstrun, currentDDCValue: currentDDCValue)
         currentDDCValue = self.getDDCValueFromPrefs(command)
       }
@@ -131,7 +142,7 @@ class OtherDisplay: Display {
       os_log("- Current internal value: %{public}@", type: .info, String(self.readPrefAsFloat(for: command)))
       os_log("- Command status: %{public}@", type: .info, self.readPrefAsBool(key: .isTouched, for: command) ? "Touched" : "Untouched")
       if command == .audioSpeakerVolume {
-        self.setupMuteUnMute()
+        self.setupMuteUnMute(reading: readings[.audioMuteScreenBlank])
       }
       self.restoreDDCSettingsToDisplay(command: command)
     } else {
@@ -143,29 +154,85 @@ class OtherDisplay: Display {
     }
   }
 
-  func setupMuteUnMute() {
+  func updateMaximum(for command: Command, reported: UInt16) {
+    let override = self.readPrefAsInt(key: .maxDDCOverride, for: command)
+    let maximum = override > self.readPrefAsInt(key: .minDDCOverride, for: command) ? override : min(Int(reported), DDC_MAX_DETECT_LIMIT)
+    self.savePref(maximum, key: .maxDDC, for: command)
+  }
+
+  func setupMuteUnMute(reading: DDCValue?) {
     guard !self.isSw(), !self.readPrefAsBool(key: .unavailableDDC, for: .audioSpeakerVolume), self.readPrefAsBool(key: .enableMuteUnmute) else {
       return
     }
     var currentMuteValue = self.readPrefAsInt(for: .audioMuteScreenBlank) == 0 ? 2 : self.readPrefAsInt(for: .audioMuteScreenBlank)
-    if self.pollingCount != 0, !app.safeMode, prefs.integer(forKey: PrefKey.startupAction.rawValue) == StartupAction.read.rawValue {
-      os_log("- Reading DDC from display %{public}@ times for Mute", type: .info, String(self.pollingCount))
-      let delay = self.readPrefAsBool(key: .longerDelay) ? UInt64(40 * kMillisecondScale) : nil
-      if let muteValues: (current: UInt16, max: UInt16) = self.readDDCValues(for: .audioMuteScreenBlank, tries: UInt(self.pollingCount), minReplyDelay: delay) {
-        os_log("- Success, current Mute setting: %{public}@", type: .info, String(muteValues.current))
-        currentMuteValue = Int(muteValues.current)
-      } else {
-        os_log("- Mute read failed", type: .info)
-      }
-    }
+    if let reading { currentMuteValue = Int(reading.current) }
     self.savePref(Int(currentMuteValue), for: .audioMuteScreenBlank)
   }
 
   func setupSliderCurrentValue(command: Command) -> Float {
-    (command == .audioSpeakerVolume && self.readPrefAsBool(key: .enableMuteUnmute) && self.readPrefAsInt(for: .audioMuteScreenBlank) == 1) ? 0 : self.readPrefAsFloat(for: command)
+    if command == .brightness, self.usesSamsungBrightness {
+      return self.getBrightness()
+    }
+    if command == .audioSpeakerVolume, self.usesSamsungVolume {
+      return self.samsungTV?.values[.audioMuteScreenBlank] == 1 ? 0 : Float(self.samsungTV?.values[command] ?? 0) / 100
+    }
+    return (command == .audioSpeakerVolume && self.readPrefAsBool(key: .enableMuteUnmute) && self.readPrefAsInt(for: .audioMuteScreenBlank) == 1) ? 0 : self.readPrefAsFloat(for: command)
+  }
+
+  func setSliderValue(_ value: Float, for command: Command) {
+    if command == .audioSpeakerVolume, self.usesSamsungVolume {
+      self.setSamsungVolume(value)
+      return
+    }
+    if command == .audioSpeakerVolume, (self.readPrefAsInt(for: .audioMuteScreenBlank) == 1 && value > 0) || (self.readPrefAsInt(for: .audioMuteScreenBlank) != 1 && value == 0) {
+      self.toggleMute(fromVolumeSlider: true)
+    }
+    if command == .brightness {
+      _ = self.setBrightness(value)
+    } else if !self.isSw() {
+      if command != .audioSpeakerVolume || !self.readPrefAsBool(key: .enableMuteUnmute) || value != 0 {
+        self.writeDDCValues(command: command, value: self.convValueToDDC(for: command, from: value))
+      }
+      self.savePref(value, for: command)
+    }
+  }
+
+  func updateSamsungTVSliders() {
+    if self.usesSamsungBrightness {
+      self.sliderHandler[.brightness]?.setValue(self.getBrightness(), displayID: self.identifier)
+    }
+    if self.usesSamsungVolume {
+      self.sliderHandler[.audioSpeakerVolume]?.setValue(self.setupSliderCurrentValue(command: .audioSpeakerVolume), displayID: self.identifier)
+    }
+  }
+
+  func setSamsungVolume(_ value: Float) {
+    guard let tv = self.samsungTV, self.usesSamsungVolume,
+          app.sleepID == 0, app.reconfigureID == 0, !app.safeMode else { return }
+    let volume = Int((max(0, min(1, value)) * 100).rounded())
+    tv.set(.audioSpeakerVolume, value: volume)
+    if volume > 0, tv.values[.audioMuteScreenBlank] == 1 {
+      tv.set(.audioMuteScreenBlank, value: 0)
+    }
   }
 
   func stepVolume(isUp: Bool, isSmallIncrement: Bool) {
+    if self.usesSamsungRemoteVolume {
+      self.samsungTV?.press(isUp ? .volumeUp : .volumeDown)
+      return
+    }
+    if let tv = self.samsungTV, self.usesSamsungVolume {
+      guard let volume = tv.values[.audioSpeakerVolume] else { tv.refreshIfNeeded(); return }
+      let step = isSmallIncrement ? 1 : 6
+      let value = Float(max(0, min(100, volume + (isUp ? step : -step)))) / 100
+      self.setSamsungVolume(value)
+      self.updateSamsungTVSliders()
+      if !self.readPrefAsBool(key: .hideOsd) {
+        OSDUtils.showOsd(displayID: self.identifier, command: .audioSpeakerVolume, value: value, roundChiclet: !isSmallIncrement)
+      }
+      return
+    }
+    if self.samsungTV != nil { return }
     guard !self.readPrefAsBool(key: .unavailableDDC, for: .audioSpeakerVolume) else {
       OSDUtils.showOsdVolumeDisabled(displayID: self.identifier)
       return
@@ -219,6 +286,18 @@ class OtherDisplay: Display {
   }
 
   func toggleMute(fromVolumeSlider: Bool = false) {
+    if let tv = self.samsungTV, tv.binding.usesRemoteVolume, !tv.binding.hasMute {
+      self.samsungTV?.press(.mute)
+      return
+    }
+    if let tv = self.samsungTV, self.usesSamsungVolume {
+      if let muted = tv.values[.audioMuteScreenBlank] {
+        tv.set(.audioMuteScreenBlank, value: 1 - muted)
+        self.updateSamsungTVSliders()
+      }
+      return
+    }
+    if self.samsungTV != nil { return }
     guard !self.readPrefAsBool(key: .unavailableDDC, for: .audioSpeakerVolume) else {
       OSDUtils.showOsdMuteDisabled(displayID: self.identifier)
       return
@@ -259,7 +338,8 @@ class OtherDisplay: Display {
   }
 
   func isSw() -> Bool {
-    if prefs.bool(forKey: PrefKey.forceSw.rawValue + self.prefsId) || self.isSwOnly() {
+    if self.samsungTV != nil || self.readPrefAsBool(key: .forceSw) || self.isSwOnly() ||
+       (self.samsungDDCResponds == false && !self.prefExists(key: .forceSw)) {
       return true
     } else {
       return false
@@ -298,6 +378,16 @@ class OtherDisplay: Display {
   }
 
   override func stepBrightness(isUp: Bool, isSmallIncrement: Bool) {
+    if let tv = self.samsungTV, self.usesSamsungBrightness {
+      guard let current = tv.values[.brightness] else { tv.refreshIfNeeded(); return }
+      let step = isSmallIncrement ? 1 : 3
+      let value = Float(max(0, min(50, current + (isUp ? step : -step)))) / 50
+      if self.setBrightness(value) {
+        self.updateSamsungTVSliders()
+        OSDUtils.showOsd(displayID: self.identifier, command: .brightness, value: value, roundChiclet: !isSmallIncrement)
+      }
+      return
+    }
     if self.isSw() {
       super.stepBrightness(isUp: isUp, isSmallIncrement: isSmallIncrement)
       return
@@ -327,12 +417,20 @@ class OtherDisplay: Display {
   }
 
   override func setBrightness(_ to: Float = -1, slow: Bool = false) -> Bool {
+    if self.usesSamsungBrightness {
+      return to >= 0 && self.setDirectBrightness(to)
+    }
     self.checkGammaInterference()
     return super.setBrightness(to, slow: slow)
   }
 
   override func setDirectBrightness(_ to: Float, transient: Bool = false) -> Bool {
     let value = max(min(to, 1), 0)
+    if let tv = self.samsungTV, self.usesSamsungBrightness {
+      guard !transient, app.sleepID == 0, app.reconfigureID == 0, !app.safeMode else { return false }
+      tv.set(.brightness, value: Int((value * 50).rounded()))
+      return true
+    }
     if !self.isSw() {
       if !prefs.bool(forKey: PrefKey.disableCombinedBrightness.rawValue) {
         var brightnessValue: Float = 0
@@ -362,7 +460,10 @@ class OtherDisplay: Display {
   }
 
   override func getBrightness() -> Float {
-    self.prefExists(for: .brightness) ? self.readPrefAsFloat(for: .brightness) : 1
+    if self.usesSamsungBrightness {
+      return Float(self.samsungTV?.values[.brightness] ?? 50) / 50
+    }
+    return self.prefExists(for: .brightness) ? self.readPrefAsFloat(for: .brightness) : 1
   }
 
   func getRemapControlCodes(command: Command) -> [UInt8] {
@@ -378,7 +479,7 @@ class OtherDisplay: Display {
   }
 
   func writeDDCValues(command: Command, value: UInt16) {
-    guard app.sleepID == 0, app.reconfigureID == 0, !self.readPrefAsBool(key: .forceSw), !self.readPrefAsBool(key: .unavailableDDC, for: command) else {
+    guard !self.transportUnavailable, self.samsungTV == nil, app.sleepID == 0, app.reconfigureID == 0, !self.readPrefAsBool(key: .forceSw), !self.readPrefAsBool(key: .unavailableDDC, for: command) else {
       return
     }
     self.writeDDCQueue.async(flags: .barrier) {
@@ -399,49 +500,171 @@ class OtherDisplay: Display {
     guard value != UInt16.max, value != lastValue else {
       return
     }
-    self.writeDDCQueue.async(flags: .barrier) {
-      self.writeDDCLastSavedValue[command] = value
-      self.savePref(true, key: PrefKey.isTouched, for: command)
-    }
     var controlCodes = self.getRemapControlCodes(command: command)
     if controlCodes.count == 0 {
       controlCodes.append(command.rawValue)
     }
+    var success = true
     for controlCode in controlCodes {
-      if Arm64DDC.isArm64 {
-        if self.arm64ddc {
-          _ = Arm64DDC.write(service: self.arm64avService, command: controlCode, value: value)
+      if !self.performDDCWrite(controlCode: controlCode, value: value) { success = false }
+    }
+    self.writeDDCQueue.sync {
+      self.writeDDCLastSavedValue[command] = success ? value : nil
+    }
+    if success { self.savePref(true, key: .isTouched, for: command) }
+    else { DispatchQueue.main.async { app.recoverDDC(for: self) } }
+  }
+
+  private func performDDCWrite(controlCode: UInt8, value: UInt16) -> Bool {
+    if Arm64DDC.isArm64 {
+      return self.arm64ddc && Arm64DDC.write(service: self.arm64avService, command: controlCode, value: value)
+    }
+    return self.ddc?.write(command: controlCode, value: value, errorRecoveryWaitTime: 2000) ?? false
+  }
+
+  func readMonitorSettings(_ commands: [Command], completion: @escaping ([Command: DDCValue], Bool) -> Void) {
+    let delay = self.readPrefAsBool(key: .longerDelay) ? UInt64(40 * kMillisecondScale) : nil
+    DisplayManager.shared.globalDDCQueue.async {
+      var values: [Command: DDCValue] = [:]
+      var transportFailed = false
+      for command in commands where self.canAccessMonitorSetting(command) {
+        let code = self.getRemapControlCodes(command: command).first ?? command.rawValue
+        if transportFailed { break }
+        if let value = self.performDDCRead(controlCode: code, tries: 2, delay: delay, transportFailure: { status in
+          transportFailed = true
+          os_log("DDC settings transport failed: 0x%{public}x", type: .error, status)
+        }) {
+          values[command] = value
+          self.writeDDCQueue.sync {
+            self.writeDDCLastSavedValue[command] = value.current
+          }
         }
-      } else {
-        _ = self.ddc?.write(command: controlCode, value: value, errorRecoveryWaitTime: 2000) ?? false
+      }
+      let result = values
+      let disconnected = transportFailed
+      DispatchQueue.main.async {
+        completion(result, disconnected)
+        if disconnected { app.recoverDDC(for: self) }
       }
     }
   }
 
-  func readDDCValues(for command: Command, tries: UInt, minReplyDelay delay: UInt64?) -> (current: UInt16, max: UInt16)? {
-    var values: (UInt16, UInt16)?
-    guard app.sleepID == 0, app.reconfigureID == 0, !self.readPrefAsBool(key: .forceSw), !self.readPrefAsBool(key: .unavailableDDC, for: command) else {
-      return values
-    }
-    let controlCodes = self.getRemapControlCodes(command: command)
-    let controlCode = controlCodes.count == 0 ? command.rawValue : controlCodes[0]
-    if Arm64DDC.isArm64 {
-      guard self.arm64ddc else {
-        return nil
+  func setMonitorSetting(_ command: Command, value: UInt16, verifyWith readCommand: Command, completion: @escaping (DDCValue?) -> Void) {
+    let controlCode = self.getRemapControlCodes(command: command).first ?? command.rawValue
+    let readCode = self.getRemapControlCodes(command: readCommand).first ?? readCommand.rawValue
+    let delay = self.readPrefAsBool(key: .longerDelay) ? UInt64(40 * kMillisecondScale) : nil
+    DisplayManager.shared.globalDDCQueue.async {
+      let result: DDCValue?
+      if self.canAccessMonitorSetting(command), self.performDDCWrite(controlCode: controlCode, value: value) {
+        result = self.performDDCRead(controlCode: readCode, tries: 2, delay: delay)
+      } else {
+        result = nil
       }
-      DisplayManager.shared.globalDDCQueue.sync {
-        if let unwrappedDelay = delay {
-          values = Arm64DDC.read(service: self.arm64avService, command: controlCode, readSleepTime: UInt32(unwrappedDelay / 1000), numOfRetryAttemps: UInt8(min(tries, 255)))
-        } else {
-          values = Arm64DDC.read(service: self.arm64avService, command: controlCode, numOfRetryAttemps: UInt8(min(tries, 255)))
+      DispatchQueue.main.async {
+        completion(result)
+        if result == nil { app.recoverDDC(for: self) }
+      }
+    }
+  }
+
+  private func canAccessMonitorSetting(_ command: Command) -> Bool {
+    self.canOpenMonitorSettings && app.sleepID == 0 && app.reconfigureID == 0 && CGDisplayIsOnline(self.identifier) != 0 &&
+      !self.readPrefAsBool(key: .unavailableDDC, for: command)
+  }
+
+  typealias DDCValue = (current: UInt16, max: UInt16)
+
+  struct StartupReadings {
+    var values: [Command: DDCValue] = [:]
+    var samsungResponds: Bool?
+    var transportFailed = false
+  }
+
+  // Called only on the serial DDC queue. The new display is published after setup.
+  func readForConfiguration(match: Arm64DDC.Arm64Service?, safeMode: Bool) -> StartupReadings {
+    var result = StartupReadings()
+    guard !safeMode, !self.isVirtual, !self.isDummy, self.samsungTV == nil,
+          !DEBUG_SW, match?.discouraged != true, match?.dummy != true,
+          match?.service != nil || self.ddc != nil else { return result }
+    let delay = self.readPrefAsBool(key: .longerDelay) ? UInt64(40 * kMillisecondScale) : nil
+    func read(_ command: Command, tries: UInt) -> DDCValue? {
+      let code = self.getRemapControlCodes(command: command).first ?? command.rawValue
+      if Arm64DDC.isArm64 {
+        return Arm64DDC.read(service: match?.service, command: code, readSleepTime: delay.map { UInt32($0 / 1000) },
+                             numOfRetryAttemps: UInt8(min(tries, 254))) { _ in result.transportFailed = true }
+      }
+      return self.ddc?.read(command: code, tries: tries, minReplyDelay: delay)
+    }
+    if self.isSamsungDisplay {
+      result.samsungResponds = read(.brightness, tries: 2).map { $0.max > 0 && $0.current <= $0.max } ?? false
+    }
+    // Verify that a proxy selected from cached metadata can still exchange DDC
+    // messages, even when startup polling is disabled.
+    if match?.serviceDetails.edidIdentity == nil, Arm64DDC.isArm64, !self.isSamsungDisplay, !self.readPrefAsBool(key: .forceSw) {
+      _ = read(.brightness, tries: 0)
+    }
+    guard !self.readPrefAsBool(key: .forceSw), result.samsungResponds != false || self.prefExists(key: .forceSw),
+          prefs.integer(forKey: PrefKey.startupAction.rawValue) == StartupAction.read.rawValue,
+          self.pollingCount > 0 else { return result }
+    var commands: [Command] = [.audioSpeakerVolume, .contrast, .brightness]
+    if self.readPrefAsBool(key: .enableMuteUnmute), !self.readPrefAsBool(key: .unavailableDDC, for: .audioSpeakerVolume) {
+      commands.append(.audioMuteScreenBlank)
+    }
+    for command in commands where !self.readPrefAsBool(key: .unavailableDDC, for: command) {
+      if result.transportFailed { break }
+      result.values[command] = read(command, tries: UInt(self.pollingCount))
+    }
+    return result
+  }
+
+  func applyConfiguration(match: Arm64DDC.Arm64Service?, readings: StartupReadings) {
+    self.transportUnavailable = readings.transportFailed || (Arm64DDC.isArm64 && match == nil)
+    self.arm64avService = match?.service
+    self.arm64RegistryID = match?.serviceDetails.registryID
+    self.arm64ddc = match?.service != nil && match?.discouraged != true && match?.dummy != true && !DEBUG_SW
+    if match?.dummy == true { self.isDummy = true }
+    self.isDiscouraged = match?.discouraged == true || match?.dummy == true
+    self.samsungDDCResponds = readings.samsungResponds ?? (self.isSamsungDisplay && match == nil && Arm64DDC.isArm64 && self.samsungTV == nil && !app.safeMode ? false : nil)
+  }
+
+  func markDDCRecovered(registryID: UInt64) {
+    self.arm64RegistryID = registryID
+    self.arm64ddc = true
+    if self.isSamsungDisplay { self.samsungDDCResponds = true }
+    for command in [Command.brightness, .contrast, .audioSpeakerVolume] where !self.prefExists(key: .maxDDC, for: command) {
+      self.updateMaximum(for: command, reported: UInt16(DDC_MAX_DETECT_LIMIT))
+    }
+  }
+
+  // Serialize handle replacement with all hardware reads and writes.
+  func releaseFailedDDCService() {
+    self.arm64avService = nil
+  }
+
+  func reopenDDC(candidates: [Arm64DDC.IOregService]) -> UInt64? {
+    for candidate in candidates {
+      guard let service = candidate.service, !Arm64DDC.checkIfDummy(ioregService: candidate),
+            !Arm64DDC.checkIfDiscouraged(ioregService: candidate) else { continue }
+      var unavailable = false
+      for command in [Command.brightness, .contrast, .audioSpeakerVolume] where !self.readPrefAsBool(key: .unavailableDDC, for: command) {
+        let code = self.getRemapControlCodes(command: command).first ?? command.rawValue
+        let reading = Arm64DDC.read(service: service, command: code, numOfWriteCycles: 1, numOfRetryAttemps: 0) { _ in unavailable = true }
+        if let reading, reading.max > 0, reading.current <= reading.max {
+          self.arm64avService = service
+          self.writeDDCQueue.sync { self.writeDDCLastSavedValue.removeAll() }
+          return candidate.registryID
         }
-      }
-    } else {
-      DisplayManager.shared.globalDDCQueue.sync {
-        values = self.ddc?.read(command: controlCode, tries: tries, minReplyDelay: delay)
+        if unavailable { break }
       }
     }
-    return values
+    return nil
+  }
+
+  private func performDDCRead(controlCode: UInt8, tries: UInt, delay: UInt64?, transportFailure: ((IOReturn) -> Void)? = nil) -> DDCValue? {
+    if Arm64DDC.isArm64 {
+      return Arm64DDC.read(service: self.arm64avService, command: controlCode, readSleepTime: delay.map { UInt32($0 / 1000) }, numOfRetryAttemps: UInt8(min(tries, 254)), transportFailure: transportFailure)
+    }
+    return self.ddc?.read(command: controlCode, tries: tries, minReplyDelay: delay)
   }
 
   func calcNewValue(currentValue: Float, isUp: Bool, isSmallIncrement: Bool, half: Bool = false) -> Float {

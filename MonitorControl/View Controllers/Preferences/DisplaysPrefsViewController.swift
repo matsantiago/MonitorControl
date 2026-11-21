@@ -17,6 +17,9 @@ class DisplaysPrefsViewController: NSViewController, SettingsPane, NSTableViewDa
   }
 
   var displays: [Display] = []
+  private var samsungSetupRunning = false
+  private var samsungSearchRunning = false
+  private var samsungSearchResults: [SamsungTVDevice]?
 
   @IBOutlet var displayList: NSTableView!
   @IBOutlet var displayScrollView: NSScrollView!
@@ -28,6 +31,11 @@ class DisplaysPrefsViewController: NSViewController, SettingsPane, NSTableViewDa
     self.displayScrollView.scrollerStyle = .legacy
     self.populateSettings()
     self.loadDisplayList()
+  }
+
+  override func viewDidAppear() {
+    super.viewDidAppear()
+    self.searchSamsungTVs()
   }
 
   func populateSettings() {
@@ -49,6 +57,9 @@ class DisplaysPrefsViewController: NSViewController, SettingsPane, NSTableViewDa
     self.displays = DisplayManager.shared.getAllDisplays()
     self.displayList?.reloadData()
     self.updateDisplayListRowHeight()
+    if self.view.window?.isVisible == true, self.samsungSearchResults == nil, !self.samsungSearchRunning {
+      self.searchSamsungTVs()
+    }
   }
 
   @IBAction func showAdvancedClicked(_ sender: NSButton) {
@@ -96,7 +107,16 @@ class DisplaysPrefsViewController: NSViewController, SettingsPane, NSTableViewDa
       displayType = NSLocalizedString("External Display", comment: "Shown in the Display Settings")
       displayImage = "display"
       if let otherDisplay: OtherDisplay = display as? OtherDisplay {
-        if otherDisplay.isSwOnly() {
+        if let tv = otherDisplay.samsungTV {
+          let method = otherDisplay.usesSamsungBrightness
+            ? NSLocalizedString("Samsung network", comment: "Display control method")
+            : NSLocalizedString("Software (Samsung TV)", comment: "Display control method")
+          controlMethod = method
+          let description = otherDisplay.usesSamsungBrightness
+            ? NSLocalizedString("MonitorControl controls the TV backlight over the local network.", comment: "Display control description")
+            : NSLocalizedString("Brightness uses software dimming.", comment: "Display control description")
+          controlStatus = [tv.binding.device.label, description, tv.status].filter { !$0.isEmpty }.joined(separator: "\n")
+        } else if otherDisplay.isSwOnly() || (otherDisplay.samsungDDCResponds == false && otherDisplay.isSw()) {
           if otherDisplay.readPrefAsBool(key: .avoidGamma) {
             controlMethod = NSLocalizedString("Software (shade)", comment: "Shown in the Display Settings") + "  ⚠️"
           } else {
@@ -104,6 +124,9 @@ class DisplaysPrefsViewController: NSViewController, SettingsPane, NSTableViewDa
           }
           displayImage = "display.trianglebadge.exclamationmark"
           controlStatus = NSLocalizedString("This display allows for software brightness control via gamma table manipulation or shade as it does not support hardware control. Reasons for this might be using the HDMI port of a Mac mini (which blocks hardware DDC control) or having a blacklisted display.", comment: "Shown in the Display Settings")
+          if otherDisplay.samsungDDCResponds == false {
+            controlStatus = NSLocalizedString("DDC brightness did not respond", comment: "Samsung TV discovery status")
+          }
         } else {
           if otherDisplay.isSw() {
             if otherDisplay.readPrefAsBool(key: .avoidGamma) {
@@ -144,6 +167,8 @@ class DisplaysPrefsViewController: NSViewController, SettingsPane, NSTableViewDa
     let display = self.displays[row]
     if let cell = tableView.makeView(withIdentifier: tableColumn.identifier, owner: nil) as? DisplaysPrefsCellView {
       cell.display = display
+      let samsungOptions = self.samsungTVOptions(for: display)
+      cell.updateSamsungTVControls(status: samsungOptions.status, button: samsungOptions.button)
 
       // ID
       cell.displayId.stringValue = String(display.identifier)
@@ -154,17 +179,17 @@ class DisplaysPrefsViewController: NSViewController, SettingsPane, NSTableViewDa
       cell.enabledButton.state = display.readPrefAsBool(key: .isDisabled) ? .off : .on
       // Enabled
       cell.avoidGamma.state = display.readPrefAsBool(key: .avoidGamma) ? .on : .off
-      if (display as? OtherDisplay)?.isVirtual ?? true {
-        cell.avoidGamma.isEnabled = false
-      } else {
+      if let otherDisplay = display as? OtherDisplay, !otherDisplay.isVirtual, !otherDisplay.usesSamsungBrightness {
         cell.avoidGamma.isEnabled = true
+      } else {
+        cell.avoidGamma.isEnabled = false
       }
       // DDC
       cell.ddcButton.state = ((display as? OtherDisplay)?.isSw() ?? true) ? .off : .on
-      if ((display as? OtherDisplay)?.isSwOnly() ?? true) || ((display as? OtherDisplay)?.isVirtual ?? true) {
-        cell.ddcButton.isEnabled = false
-      } else {
+      if let otherDisplay = display as? OtherDisplay, !otherDisplay.isSwOnly(), otherDisplay.samsungTV == nil {
         cell.ddcButton.isEnabled = true
+      } else {
+        cell.ddcButton.isEnabled = false
       }
       // Display type, image, control method
       let displayInfo = DisplaysPrefsViewController.getDisplayInfo(display: display)
@@ -177,7 +202,7 @@ class DisplaysPrefsViewController: NSViewController, SettingsPane, NSTableViewDa
         cell.displayImage.image = NSImage(named: NSImage.touchBarIconViewTemplateName)!
       }
       // Disable Volume OSD
-      if let otherDisplay = display as? OtherDisplay, !otherDisplay.isSw() {
+      if let otherDisplay = display as? OtherDisplay, otherDisplay.usesSamsungVolume || !otherDisplay.isSw() {
         cell.disableVolumeOSDButton.state = otherDisplay.readPrefAsBool(key: .hideOsd) ? .on : .off
         cell.disableVolumeOSDButton.isEnabled = true
       } else {
@@ -186,7 +211,7 @@ class DisplaysPrefsViewController: NSViewController, SettingsPane, NSTableViewDa
       }
       // Advanced settings
       cell.unavailableDDCBrightness.state = !display.readPrefAsBool(key: .unavailableDDC, for: .brightness) ? .on : .off
-      if let otherDisplay = display as? OtherDisplay, !otherDisplay.isSwOnly() {
+      if let otherDisplay = display as? OtherDisplay, !otherDisplay.isSwOnly(), otherDisplay.samsungTV == nil {
         cell.pollingModeMenu.isEnabled = true
         cell.pollingModeMenu.selectItem(withTag: otherDisplay.readPrefAsInt(key: .pollingMode))
         if otherDisplay.readPrefAsInt(key: .pollingMode) == PollingMode.custom.rawValue {
@@ -320,6 +345,267 @@ class DisplaysPrefsViewController: NSViewController, SettingsPane, NSTableViewDa
     } else {
       self.displayList?.rowHeight = 180
       self.constraintHeight?.constant = self.displayList.rowHeight * 2 + 15 + 30
+    }
+  }
+}
+
+extension DisplaysPrefsViewController {
+  private var availableSamsungTVs: [SamsungTVDevice] {
+    let linkedIDs = Set(self.displays.compactMap { ($0 as? OtherDisplay)?.samsungTV?.binding.device.id })
+    return (self.samsungSearchResults ?? []).filter { !linkedIDs.contains($0.id) }
+  }
+
+  private func samsungTVOptions(for display: Display) -> (status: String?, button: String?) {
+    guard let display = display as? OtherDisplay else { return (nil, nil) }
+    if let tv = display.samsungTV {
+      let button: String?
+      if tv.needsPairing, tv.online != false {
+        button = NSLocalizedString("Set Up TV…", comment: "Display settings button")
+      } else if prefs.bool(forKey: PrefKey.showAdvancedSettings.rawValue) {
+        button = NSLocalizedString("Manage TV Link…", comment: "Display settings button")
+      } else {
+        button = nil
+      }
+      return (tv.connectionLabel, button)
+    }
+    guard display.canDiscoverSamsungTV else { return (nil, nil) }
+    if self.samsungSearchRunning {
+      return (NSLocalizedString("Searching for Samsung TVs…", comment: "Samsung TV discovery progress"), nil)
+    }
+    if !self.availableSamsungTVs.isEmpty {
+      return (NSLocalizedString("Samsung TV available over the network", comment: "Samsung TV discovery status"),
+              NSLocalizedString("Set Up TV…", comment: "Display settings button"))
+    }
+    let status = self.samsungSearchResults == nil
+      ? NSLocalizedString("DDC brightness did not respond", comment: "Samsung TV discovery status")
+      : NSLocalizedString("No Samsung TVs found", comment: "Samsung TV discovery result")
+    return (status, NSLocalizedString("Find TV…", comment: "Display settings button"))
+  }
+
+  private func searchSamsungTVs() {
+    guard !self.samsungSearchRunning, self.displays.contains(where: { ($0 as? OtherDisplay)?.canDiscoverSamsungTV == true }) else { return }
+    self.samsungSearchRunning = true
+    self.loadDisplayList()
+    SamsungTVControl.setupQueue.async {
+      let devices = (try? SamsungTVDevice.discover()) ?? []
+      DispatchQueue.main.async {
+        self.samsungSearchResults = devices
+        self.samsungSearchRunning = false
+        self.loadDisplayList()
+      }
+    }
+  }
+
+  func configureSamsungTV(for display: OtherDisplay, in window: NSWindow) {
+    guard !self.samsungSetupRunning else { return }
+    guard let tv = display.samsungTV else {
+      if !self.availableSamsungTVs.isEmpty {
+        self.selectSamsungTV(for: display, in: window)
+      } else {
+        self.searchSamsungTVs()
+      }
+      return
+    }
+
+    let alert = NSAlert()
+    alert.messageText = NSLocalizedString("Samsung TV over network", comment: "Samsung TV settings title")
+    let brightness = display.usesSamsungBrightness
+      ? NSLocalizedString("Brightness: TV backlight", comment: "Samsung TV brightness mode")
+      : NSLocalizedString("Brightness: software dimming", comment: "Samsung TV brightness mode")
+    let volume: String
+    if display.usesSamsungVolume {
+      volume = NSLocalizedString("Volume: slider", comment: "Samsung TV volume mode")
+    } else if display.usesSamsungRemoteVolume {
+      volume = NSLocalizedString("Volume: remote buttons", comment: "Samsung TV volume mode")
+    } else {
+      volume = NSLocalizedString("Volume: pairing required", comment: "Samsung TV volume mode")
+    }
+    alert.informativeText = [tv.binding.device.label, brightness, volume, tv.status].filter { !$0.isEmpty }.joined(separator: "\n")
+
+    var actions: [(title: String, handler: (() -> Void)?)] = []
+    if tv.online != false, tv.canPairIP {
+      actions.append((NSLocalizedString("Pair Brightness and Volume…", comment: "Start IP Control pairing"),
+                      { self.confirmSamsungBrightness(for: display, in: window) }))
+    }
+    if tv.online != false, tv.canPairRemoteVolume {
+      actions.append((NSLocalizedString("Pair Volume Only…", comment: "Start TV remote pairing"),
+                      { self.pairSamsungVolume(for: display, in: window) }))
+    }
+    let closeTitle = actions.isEmpty ? NSLocalizedString("OK", comment: "Dismiss alert") : NSLocalizedString("Cancel", comment: "Cancel button")
+    actions.append((closeTitle, nil))
+    if prefs.bool(forKey: PrefKey.showAdvancedSettings.rawValue) {
+      actions.append((NSLocalizedString("Forget TV", comment: "Remove association with Samsung TV"),
+                      { self.forgetSamsungTV(for: display, in: window) }))
+    }
+    for action in actions {
+      alert.addButton(withTitle: action.title)
+    }
+    alert.beginSheetModal(for: window) { response in
+      let index = response.rawValue - NSApplication.ModalResponse.alertFirstButtonReturn.rawValue
+      if actions.indices.contains(index) { actions[index].handler?() }
+    }
+  }
+
+  private func selectSamsungTV(for display: OtherDisplay, in window: NSWindow) {
+    let devices = self.availableSamsungTVs
+    let picker = NSPopUpButton(frame: NSRect(x: 0, y: 0, width: 360, height: 26))
+    picker.addItems(withTitles: devices.map(\.label))
+    let alert = NSAlert()
+    alert.messageText = NSLocalizedString("Select the TV for this display", comment: "Samsung TV picker")
+    alert.accessoryView = picker
+    alert.addButton(withTitle: NSLocalizedString("Connect", comment: "Connect to selected Samsung TV"))
+    alert.addButton(withTitle: NSLocalizedString("Cancel", comment: "Cancel button"))
+    alert.beginSheetModal(for: window) { response in
+      guard response == .alertFirstButtonReturn, devices.indices.contains(picker.indexOfSelectedItem),
+            let current = self.currentDisplay(for: display, in: window) else { return }
+      let device = devices[picker.indexOfSelectedItem]
+      guard self.availableSamsungTVs.contains(where: { $0.id == device.id }) else { return }
+      self.connectSamsungTV(device, to: current, in: window)
+    }
+  }
+
+  private func connectSamsungTV(_ device: SamsungTVDevice, to display: OtherDisplay, in window: NSWindow) {
+    let binding = SamsungTVBinding(device: device)
+    self.installSamsungTV(binding, values: [:], on: display)
+    self.configureSamsungTV(for: display, in: window)
+  }
+
+  private func pairSamsungVolume(for display: OtherDisplay, in window: NSWindow) {
+    guard let tv = display.samsungTV else { return }
+    let binding = tv.binding
+    self.runSamsungSetup(in: window, message: NSLocalizedString("Checking volume. Allow MonitorControl if the TV asks.", comment: "Samsung TV volume setup progress"), work: {
+      guard let device = binding.device.currentAddress() else { throw SamsungTVError.discovery }
+      var updated = binding
+      updated.device = device
+      if #available(macOS 10.15, *) {
+        let credential = try device.pairRemote()
+        try credential.save(device.remoteAccount)
+        updated.usesRemoteVolume = true
+        return updated
+      }
+      throw SamsungTVError.unsupported
+    }) { result in
+      guard let current = self.currentDisplay(for: display, in: window) else { return }
+      switch result {
+      case let .success(updated):
+        self.installSamsungTV(updated, values: tv.values, on: current)
+      case .failure:
+        self.showSamsungMessage(NSLocalizedString("TV remote unavailable", comment: "Samsung TV volume pairing failed"),
+                                detail: NSLocalizedString("Keep the TV on, allow MonitorControl on the TV, and try Pair Volume Only again.", comment: "Samsung TV volume pairing troubleshooting"), in: window)
+      }
+    }
+  }
+
+  private func confirmSamsungBrightness(for display: OtherDisplay, in window: NSWindow) {
+    guard let tv = display.samsungTV else { return }
+    let alert = NSAlert()
+    alert.messageText = NSLocalizedString("Pair TV brightness and volume", comment: "Samsung TV brightness setup")
+    alert.informativeText = NSLocalizedString("On the TV, open All Settings → Connection → Network → Expert Settings. Enable Power On with Mobile, followed by IP Remote. Switch to the Mac’s HDMI input, then click Pair and approve on the TV.", comment: "Samsung TV brightness setup instructions")
+    alert.addButton(withTitle: NSLocalizedString("Pair", comment: "Start TV pairing"))
+    alert.addButton(withTitle: NSLocalizedString("Cancel", comment: "Cancel button"))
+    alert.beginSheetModal(for: window) { response in
+      guard response == .alertFirstButtonReturn else { return }
+      let binding = tv.binding
+      self.runSamsungSetup(in: window, message: NSLocalizedString("Waiting for approval on the TV…", comment: "Samsung TV pairing progress"), work: {
+        guard let device = binding.device.currentAddress() else { throw SamsungTVError.discovery }
+        let credential = try device.pair()
+        let brightness = try? device.backlight(using: credential)
+        let volume = try? device.ipVolume(using: credential)
+        let muted = volume == nil ? nil : try? device.ipMute(using: credential)
+        guard brightness != nil || volume != nil else { throw SamsungTVError.unsupported }
+        try credential.save(device.id)
+        return (device, brightness, volume, muted)
+      }) { result in
+        guard let current = self.currentDisplay(for: display, in: window) else { return }
+        switch result {
+        case let .success((device, brightness, volume, muted)):
+          var updatedBinding = binding
+          updatedBinding.device = device
+          updatedBinding.hasBrightness = brightness != nil
+          updatedBinding.hasVolume = volume != nil
+          updatedBinding.hasMute = muted != nil
+          var values = tv.values
+          values[.brightness] = brightness
+          values[.audioSpeakerVolume] = volume
+          values[.audioMuteScreenBlank] = muted
+          self.installSamsungTV(updatedBinding, values: values, on: current)
+        case let .failure(error):
+          let detail: String
+          switch error {
+          case SamsungTVError.unsupported:
+            detail = NSLocalizedString("The TV paired but did not expose backlight or volume adjustment on this input or firmware.", comment: "Samsung TV backlight unsupported")
+          case SamsungTVError.keychain:
+            detail = NSLocalizedString("MonitorControl could not save the TV’s pairing in Keychain.", comment: "Samsung TV Keychain error")
+          default:
+            detail = NSLocalizedString("Check that IP Remote is enabled, keep the Mac’s HDMI input visible, and approve the pairing prompt on the TV.", comment: "Samsung TV pairing troubleshooting")
+          }
+          self.showSamsungMessage(NSLocalizedString("Samsung IP Control unavailable", comment: "Samsung TV pairing failed"), detail: detail, in: window)
+        }
+      }
+    }
+  }
+
+  private func installSamsungTV(_ binding: SamsungTVBinding, values: [Command: Int], on display: OtherDisplay) {
+    binding.save(for: display)
+    display.samsungTV = SamsungTVControl(display: display, binding: binding, values: values)
+    if binding.hasBrightness { _ = display.setSwBrightness(1) }
+    app.updateMenusAndKeys()
+    self.loadDisplayList()
+  }
+
+  private func forgetSamsungTV(for display: OtherDisplay, in window: NSWindow) {
+    guard let binding = display.samsungTV?.binding else { return }
+    self.runSamsungSetup(in: window, message: NSLocalizedString("Removing TV link…", comment: "Samsung TV setup progress"), work: {
+      try SamsungTVCredential.remove(binding.device.id)
+      try SamsungTVCredential.remove(binding.device.remoteAccount)
+    }) { result in
+      guard (try? result.get()) != nil else {
+        self.showSamsungMessage(NSLocalizedString("Could not remove the TV’s Keychain item.", comment: "Samsung TV error"), in: window)
+        return
+      }
+      SamsungTVBinding.remove(for: display)
+      if let current = DisplayManager.shared.getOtherDisplays().first(where: { $0.prefsId == display.prefsId }) {
+        current.samsungTV = nil
+      }
+      app.configure()
+    }
+  }
+
+  private func currentDisplay(for display: OtherDisplay, in window: NSWindow) -> OtherDisplay? {
+    if let current = DisplayManager.shared.getOtherDisplays().first(where: { $0.prefsId == display.prefsId }) {
+      return current
+    }
+    self.showSamsungMessage(NSLocalizedString("The display was disconnected.", comment: "Samsung TV setup error"), in: window)
+    return nil
+  }
+
+  private func showSamsungMessage(_ title: String, detail: String = "", in window: NSWindow) {
+    let alert = NSAlert()
+    alert.messageText = title
+    alert.informativeText = detail
+    alert.addButton(withTitle: NSLocalizedString("OK", comment: "Dismiss alert"))
+    alert.beginSheetModal(for: window)
+  }
+
+  private func runSamsungSetup<Value>(in window: NSWindow, message: String, work: @escaping () throws -> Value,
+                                      completed: @escaping (Result<Value, Error>) -> Void) {
+    self.samsungSetupRunning = true
+    let sheet = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 370, height: 86), styleMask: [.titled], backing: .buffered, defer: false)
+    let indicator = NSProgressIndicator(frame: NSRect(x: 24, y: 29, width: 24, height: 24))
+    indicator.style = .spinning
+    indicator.startAnimation(nil)
+    sheet.contentView?.addSubview(indicator)
+    let label = NSTextField(wrappingLabelWithString: message)
+    label.frame = NSRect(x: 60, y: 23, width: 286, height: 36)
+    sheet.contentView?.addSubview(label)
+    window.beginSheet(sheet)
+    SamsungTVControl.setupQueue.async {
+      let result = Result { try work() }
+      DispatchQueue.main.async {
+        self.samsungSetupRunning = false
+        window.endSheet(sheet)
+        completed(result)
+      }
     }
   }
 }

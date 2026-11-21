@@ -52,6 +52,39 @@ class DisplaysPrefsCellView: NSTableCellView {
   @IBOutlet var remapDDCVolume: NSTextField!
   @IBOutlet var remapDDCContrast: NSTextField!
 
+  private let samsungTVStatus = NSTextField(labelWithString: "")
+  private lazy var samsungTVButton = NSButton(title: "", target: self, action: #selector(self.samsungTVClicked))
+  private lazy var samsungTVControls: NSStackView = {
+    self.samsungTVStatus.font = .systemFont(ofSize: NSFont.smallSystemFontSize)
+    self.samsungTVStatus.textColor = .secondaryLabelColor
+    self.samsungTVButton.controlSize = .small
+    self.samsungTVButton.font = .systemFont(ofSize: NSFont.smallSystemFontSize)
+    let controls = NSStackView(views: [self.samsungTVStatus, self.samsungTVButton])
+    controls.alignment = .centerY
+    controls.spacing = 8
+    controls.translatesAutoresizingMaskIntoConstraints = false
+    self.addSubview(controls)
+    NSLayoutConstraint.activate([
+      controls.leadingAnchor.constraint(equalTo: self.leadingAnchor, constant: 78),
+      controls.topAnchor.constraint(equalTo: self.topAnchor, constant: 142),
+      controls.trailingAnchor.constraint(lessThanOrEqualTo: self.trailingAnchor, constant: -16),
+    ])
+    return controls
+  }()
+
+  func updateSamsungTVControls(status: String?, button: String?) {
+    self.samsungTVControls.isHidden = status == nil && button == nil
+    self.samsungTVStatus.stringValue = status ?? ""
+    self.samsungTVStatus.isHidden = status == nil
+    self.samsungTVButton.title = button ?? ""
+    self.samsungTVButton.isHidden = button == nil
+  }
+
+  @objc private func samsungTVClicked() {
+    guard let display = self.display as? OtherDisplay, let window = self.window else { return }
+    displaysPrefsVc?.configureSamsungTV(for: display, in: window)
+  }
+
   @IBAction func pollingModeValueChanged(_ sender: NSPopUpButton) {
     if let display = display as? OtherDisplay {
       let newValue = sender.selectedTag()

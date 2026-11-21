@@ -2,6 +2,7 @@
 
 import Foundation
 import IOKit
+import os.log
 
 let ARM64_DDC_7BIT_ADDRESS: UInt8 = 0x37 // This works with DisplayPort devices
 let ARM64_DDC_DATA_ADDRESS: UInt8 = 0x51
@@ -25,9 +26,8 @@ class Arm64DDC: NSObject {
       self.serial = CGDisplaySerialNumber(displayID)
     }
 
-    init?(service: IOAVService) {
-      var edid = [UInt8](repeating: 0, count: 128)
-      guard IOAVServiceReadI2C(service, 0x50, 0, &edid, UInt32(edid.count)) == KERN_SUCCESS,
+    init?(edid: [UInt8]) {
+      guard edid.count == 128,
             edid.prefix(8).elementsEqual([0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x00]),
             edid.reduce(0, &+) == 0
       else {
@@ -58,6 +58,8 @@ class Arm64DDC: NSObject {
     var serviceLocation: Int = 0
     var registryID: UInt64 = 0
     var edidIdentity: EDIDIdentity?
+    var cachedIdentity: EDIDIdentity?
+    var edidReadStatus: IOReturn = kIOReturnNotReady
     var displayAttributes: NSDictionary?
   }
 
@@ -72,7 +74,26 @@ class Arm64DDC: NSObject {
   }
 
   static func getServiceMatches(displayIDs: [CGDirectDisplayID]) -> [Arm64Service] {
-    let ioregServicesForMatching = self.getIoregServicesForMatching().filter { $0.service != nil }
+    self.getServiceMatches(displayIDs: displayIDs, services: self.getIoregServicesForMatching())
+  }
+
+  static func recoveryCandidates(for id: CGDirectDisplayID, among ids: [CGDirectDisplayID]) -> [IOregService] {
+    let identity = EDIDIdentity(displayID: id)
+    let services = self.getIoregServicesForMatching(target: identity)
+    let matches = self.getServiceMatches(displayIDs: ids, services: services)
+    let preferred = matches.first { $0.displayID == id }?.serviceDetails
+    var candidates = preferred.map { [$0] } ?? []
+    guard ids.filter({ identity.isCompatible(with: EDIDIdentity(displayID: $0)) }).count == 1 else { return candidates }
+    let assigned = Set(matches.map { $0.serviceDetails.registryID })
+    candidates += services.filter { candidate in
+      candidate.service != nil && !assigned.contains(candidate.registryID) &&
+        (candidate.edidIdentity ?? candidate.cachedIdentity)?.isCompatible(with: identity) == true
+    }
+    return candidates
+  }
+
+  private static func getServiceMatches(displayIDs: [CGDirectDisplayID], services: [IOregService]) -> [Arm64Service] {
+    let ioregServicesForMatching = services.filter { $0.service != nil }
     let displaysByIdentity = Dictionary(grouping: displayIDs) { EDIDIdentity(displayID: $0) }
     let servicesByIdentity = Dictionary(grouping: ioregServicesForMatching, by: \.edidIdentity)
     var matchedDisplayServices: [Arm64Service] = []
@@ -100,6 +121,7 @@ class Arm64DDC: NSObject {
       for ioregServiceForMatching in ioregServicesForMatching where !takenRegistryIDs.contains(ioregServiceForMatching.registryID) {
         // Keep the metadata fallback for unreadable EDIDs and overrides, but
         // never point it at a proxy known to serve a different online display.
+        if let cached = ioregServiceForMatching.cachedIdentity, !cached.isCompatible(with: identity) { continue }
         let liveIdentity = ioregServiceForMatching.edidIdentity
         if let liveIdentity, !liveIdentity.isCompatible(with: identity),
            displaysByIdentity.keys.contains(where: { liveIdentity.isCompatible(with: $0) })
@@ -112,7 +134,7 @@ class Arm64DDC: NSObject {
         }
         let displayService = self.serviceMatch(displayID: displayID, candidate: ioregServiceForMatching, score: score)
         // Ties still use registry topology to distinguish identical displays.
-        let priority = score * 2 + (liveIdentity?.isCompatible(with: identity) == true ? 1 : 0)
+        let priority = score * 4 + (liveIdentity?.isCompatible(with: identity) == true ? 2 : 0) + (ioregServiceForMatching.cachedIdentity?.isCompatible(with: identity) == true ? 1 : 0)
         scoredCandidateDisplayServices[priority, default: []].append(displayService)
       }
     }
@@ -136,11 +158,12 @@ class Arm64DDC: NSObject {
     Arm64Service(displayID: displayID, service: candidate.service, serviceLocation: candidate.serviceLocation, discouraged: self.checkIfDiscouraged(ioregService: candidate), dummy: self.checkIfDummy(ioregService: candidate), serviceDetails: candidate, matchScore: score)
   }
 
-  static func read(service: IOAVService?, command: UInt8, writeSleepTime: UInt32? = nil, numOfWriteCycles: UInt8? = nil, readSleepTime: UInt32? = nil, numOfRetryAttemps: UInt8? = nil, retrySleepTime: UInt32? = nil) -> (current: UInt16, max: UInt16)? {
+  static func read(service: IOAVService?, command: UInt8, writeSleepTime: UInt32? = nil, numOfWriteCycles: UInt8? = nil, readSleepTime: UInt32? = nil, numOfRetryAttemps: UInt8? = nil, retrySleepTime: UInt32? = nil, transportFailure: ((IOReturn) -> Void)? = nil) -> (current: UInt16, max: UInt16)? {
     var values: (UInt16, UInt16)?
     var send: [UInt8] = [command]
     var reply = [UInt8](repeating: 0, count: 11)
-    if Self.performDDCCommunication(service: service, send: &send, reply: &reply, writeSleepTime: writeSleepTime, numOfWriteCycles: numOfWriteCycles, readSleepTime: readSleepTime, numOfRetryAttemps: numOfRetryAttemps, retrySleepTime: retrySleepTime) {
+    if Self.performDDCCommunication(service: service, send: &send, reply: &reply, writeSleepTime: writeSleepTime, numOfWriteCycles: numOfWriteCycles, readSleepTime: readSleepTime, numOfRetryAttemps: numOfRetryAttemps, retrySleepTime: retrySleepTime, transportFailure: transportFailure),
+       reply[2] == 0x02, reply[3] == 0, reply[4] == command {
       let max = UInt16(reply[6]) * 256 + UInt16(reply[7])
       let current = UInt16(reply[8]) * 256 + UInt16(reply[9])
       values = (current, max)
@@ -156,31 +179,38 @@ class Arm64DDC: NSObject {
     return Self.performDDCCommunication(service: service, send: &send, reply: &reply, writeSleepTime: writeSleepTime, numOfWriteCycles: numOfWriteCycles, numOfRetryAttemps: numOfRetryAttemps, retrySleepTime: retrySleepTime)
   }
 
-  static func performDDCCommunication(service: IOAVService?, send: inout [UInt8], reply: inout [UInt8], writeSleepTime: UInt32? = nil, numOfWriteCycles: UInt8? = nil, readSleepTime: UInt32? = nil, numOfRetryAttemps: UInt8? = nil, retrySleepTime: UInt32? = nil) -> Bool {
+  static func performDDCCommunication(service: IOAVService?, send: inout [UInt8], reply: inout [UInt8], writeSleepTime: UInt32? = nil, numOfWriteCycles: UInt8? = nil, readSleepTime: UInt32? = nil, numOfRetryAttemps: UInt8? = nil, retrySleepTime: UInt32? = nil, transportFailure: ((IOReturn) -> Void)? = nil) -> Bool {
     let dataAddress = ARM64_DDC_DATA_ADDRESS
-    var success = false
-    guard service != nil else {
-      return success
+    var lastStatus = kIOReturnSuccess
+    guard let service else {
+      transportFailure?(kIOReturnNoDevice)
+      return false
     }
     var packet: [UInt8] = [UInt8(0x80 | (send.count + 1)), UInt8(send.count)] + send + [0] // Note: the last byte is the place of the checksum, see next line!
     packet[packet.count - 1] = self.checksum(chk: send.count == 1 ? ARM64_DDC_7BIT_ADDRESS << 1 : ARM64_DDC_7BIT_ADDRESS << 1 ^ dataAddress, data: &packet, start: 0, end: packet.count - 2)
     for _ in 1 ... (numOfRetryAttemps ?? 4) + 1 {
       for _ in 1 ... max((numOfWriteCycles ?? 2) + 0, 1) {
         usleep(writeSleepTime ?? 10000)
-        success = IOAVServiceWriteI2C(service, UInt32(ARM64_DDC_7BIT_ADDRESS), UInt32(dataAddress), &packet, UInt32(packet.count)) == 0
+        lastStatus = IOAVServiceWriteI2C(service, UInt32(ARM64_DDC_7BIT_ADDRESS), UInt32(dataAddress), &packet, UInt32(packet.count))
+        if lastStatus != kIOReturnSuccess { break }
       }
-      if !reply.isEmpty {
-        usleep(readSleepTime ?? 50000)
-        if IOAVServiceReadI2C(service, UInt32(ARM64_DDC_7BIT_ADDRESS), 0, &reply, UInt32(reply.count)) == 0 {
-          success = self.checksum(chk: 0x50, data: &reply, start: 0, end: reply.count - 2) == reply[reply.count - 1]
-        }
+      // A failed request cannot have a valid reply. Leave recovery to rediscovery.
+      if lastStatus == kIOReturnBusy || lastStatus == kIOReturnNotReady {
+        usleep(retrySleepTime ?? 20000)
+        continue
       }
-      if success {
-        return success
+      guard lastStatus == kIOReturnSuccess else { break }
+      if reply.isEmpty { return true }
+      usleep(readSleepTime ?? 50000)
+      lastStatus = IOAVServiceReadI2C(service, UInt32(ARM64_DDC_7BIT_ADDRESS), 0, &reply, UInt32(reply.count))
+      guard lastStatus == kIOReturnSuccess else { break }
+      if self.checksum(chk: 0x50, data: &reply, start: 0, end: reply.count - 2) == reply[reply.count - 1] {
+        return true
       }
       usleep(retrySleepTime ?? 20000)
     }
-    return success
+    if lastStatus != kIOReturnSuccess { transportFailure?(lastStatus) }
+    return false
   }
 
   /// DDC checksum calculator
@@ -256,6 +286,7 @@ class Arm64DDC: NSObject {
       ioregService.edidUUID = edidUUID
     }
     let cpath = UnsafeMutablePointer<CChar>.allocate(capacity: MemoryLayout<io_string_t>.size)
+    defer { cpath.deallocate() }
     IORegistryEntryGetPath(entry, kIOServicePlane, cpath)
     ioregService.ioDisplayLocation = String(cString: cpath)
     if let unmanagedDisplayAttrs = IORegistryEntryCreateCFProperty(entry, "DisplayAttributes" as CFString, kCFAllocatorDefault, IOOptionBits(kIORegistryIterateRecursively)), let displayAttrs = unmanagedDisplayAttrs.takeRetainedValue() as? NSDictionary {
@@ -286,20 +317,41 @@ class Arm64DDC: NSObject {
     return ioregService
   }
 
-  static func setIORegServiceDCPAVServiceProxy(entry: io_service_t, ioregService: inout IOregService) {
+  static func setIORegServiceDCPAVServiceProxy(entry: io_service_t, ioregService: inout IOregService, target: EDIDIdentity?) {
     IORegistryEntryGetRegistryEntryID(entry, &ioregService.registryID)
     if let unmanagedLocation = IORegistryEntryCreateCFProperty(entry, "Location" as CFString, kCFAllocatorDefault, IOOptionBits(kIORegistryIterateRecursively)), let location = unmanagedLocation.takeRetainedValue() as? String {
       ioregService.location = location
       if location == "External", let service = IOAVServiceCreateWithService(kCFAllocatorDefault, entry)?.takeRetainedValue() {
+        if let target {
+          ioregService.cachedIdentity = self.cachedIdentity(of: service)
+          // Skip healthy monitors on other ports during background recovery.
+          if let cached = ioregService.cachedIdentity, !cached.isCompatible(with: target) { return }
+        }
+        var bytes = [UInt8](repeating: 0, count: 128)
+        let status = IOAVServiceReadI2C(service, 0x50, 0, &bytes, UInt32(bytes.count))
+        ioregService.edidReadStatus = status
+        // Detached proxies can retain the framebuffer name and even a cached EDID.
+        guard status != kIOReturnNoDevice, status != kIOReturnNotAttached else { return }
         ioregService.service = service
-        ioregService.edidIdentity = EDIDIdentity(service: service)
+        if status == kIOReturnSuccess { ioregService.edidIdentity = EDIDIdentity(edid: bytes) }
+        if ioregService.edidIdentity == nil {
+          if target == nil { ioregService.cachedIdentity = self.cachedIdentity(of: service) }
+          os_log("Display proxy %{public}llu live EDID status 0x%{public}x", type: .info, ioregService.registryID, status)
+        }
       }
     }
   }
 
-  static func getIoregServicesForMatching() -> [IOregService] {
+  private static func cachedIdentity(of service: IOAVService) -> EDIDIdentity? {
+    var cached: Unmanaged<CFData>?
+    let result = IOAVServiceCopyEDID(service, &cached)
+    guard let data = cached?.takeRetainedValue() as Data?, result == kIOReturnSuccess else { return nil }
+    return EDIDIdentity(edid: Array(data.prefix(128)))
+  }
+
+  static func getIoregServicesForMatching(target: EDIDIdentity? = nil) -> [IOregService] {
     var serviceLocation = 0
-    var ioregServicesForMatching: [IOregService] = []
+    var proxies: [(entry: io_service_t, framebuffer: IOregService)] = []
     let ioregRoot: io_registry_entry_t = IORegistryGetRootEntry(kIOMasterPortDefault)
     defer {
       IOObjectRelease(ioregRoot)
@@ -310,7 +362,7 @@ class Arm64DDC: NSObject {
     }
     var ioregService = IOregService()
     guard IORegistryEntryCreateIterator(ioregRoot, "IOService", IOOptionBits(kIORegistryIterateRecursively), &iterator) == KERN_SUCCESS else {
-      return ioregServicesForMatching
+      return []
     }
     let keyDCPAVServiceProxy = "DCPAVServiceProxy"
     let keysFramebuffer = ["AppleCLCD2", "IOMobileFramebufferShim"]
@@ -318,18 +370,25 @@ class Arm64DDC: NSObject {
       guard let objectOfInterest = ioregIterateToNextObjectOfInterest(interests: [keyDCPAVServiceProxy] + keysFramebuffer, iterator: iterator) else {
         break
       }
-      defer { IOObjectRelease(objectOfInterest.entry) }
       if keysFramebuffer.contains(objectOfInterest.name) {
         ioregService = self.getIORegServiceAppleCDC2Properties(entry: objectOfInterest.entry)
+        IOObjectRelease(objectOfInterest.entry)
         serviceLocation += 1
         ioregService.serviceLocation = serviceLocation
       } else if objectOfInterest.name == keyDCPAVServiceProxy {
-        var candidate = ioregService
-        self.setIORegServiceDCPAVServiceProxy(entry: objectOfInterest.entry, ioregService: &candidate)
-        ioregServicesForMatching.append(candidate)
+        proxies.append((objectOfInterest.entry, ioregService))
+      } else {
+        IOObjectRelease(objectOfInterest.entry)
       }
     }
-    return ioregServicesForMatching
+    // Opening an AV service adds a user client to the registry. Finish walking
+    // the registry first so our own I/O cannot invalidate its recursive iterator.
+    return proxies.map { proxy in
+      defer { IOObjectRelease(proxy.entry) }
+      var candidate = proxy.framebuffer
+      self.setIORegServiceDCPAVServiceProxy(entry: proxy.entry, ioregService: &candidate, target: target)
+      return candidate
+    }
   }
 
   static func checkIfDummy(ioregService: IOregService) -> Bool {
@@ -341,5 +400,50 @@ class Arm64DDC: NSObject {
 
   static func checkIfDiscouraged(ioregService _: IOregService) -> Bool {
     false
+  }
+}
+
+// IOKit can publish a replacement DDC endpoint without changing the desktop layout.
+final class DDCServiceObserver {
+  private let port: IONotificationPortRef
+  private var added: io_iterator_t = 0
+  private var removed: io_iterator_t = 0
+  private let changed: (Bool, Set<UInt64>) -> Void
+
+  init?(changed: @escaping (Bool, Set<UInt64>) -> Void) {
+    guard let port = IONotificationPortCreate(kIOMasterPortDefault) else { return nil }
+    self.port = port
+    self.changed = changed
+    IONotificationPortSetDispatchQueue(port, .main)
+    let context = Unmanaged.passUnretained(self).toOpaque()
+    let callback: IOServiceMatchingCallback = { context, iterator in
+      guard let context else { return }
+      let observer = Unmanaged<DDCServiceObserver>.fromOpaque(context).takeUnretainedValue()
+      let ids = DDCServiceObserver.drain(iterator)
+      if !ids.isEmpty { observer.changed(iterator == observer.added, ids) }
+    }
+    guard IOServiceAddMatchingNotification(port, kIOFirstMatchNotification, IOServiceMatching("DCPAVServiceProxy"), callback, context, &self.added) == KERN_SUCCESS,
+          IOServiceAddMatchingNotification(port, kIOTerminatedNotification, IOServiceMatching("DCPAVServiceProxy"), callback, context, &self.removed) == KERN_SUCCESS else { return nil }
+    // Draining arms the notifications. Existing services are handled by startup.
+    _ = Self.drain(self.added)
+    _ = Self.drain(self.removed)
+  }
+
+  private static func drain(_ iterator: io_iterator_t) -> Set<UInt64> {
+    var ids = Set<UInt64>()
+    while true {
+      let entry = IOIteratorNext(iterator)
+      guard entry != IO_OBJECT_NULL else { break }
+      var id: UInt64 = 0
+      if IORegistryEntryGetRegistryEntryID(entry, &id) == KERN_SUCCESS { ids.insert(id) }
+      IOObjectRelease(entry)
+    }
+    return ids
+  }
+
+  deinit {
+    IONotificationPortDestroy(self.port)
+    if self.added != 0 { IOObjectRelease(self.added) }
+    if self.removed != 0 { IOObjectRelease(self.removed) }
   }
 }
